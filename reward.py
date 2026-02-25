@@ -77,7 +77,7 @@ def load_ref_fens():
       np.save(REF_FENS_CACHE_PATH, REF_FENS)
   return REF_FENS
 
-# load_ref_fens() 
+# load_ref_fens()
 
 def min_fen_distance(fen: str, ref_fens: list[str] = None) -> int:
   if ref_fens is None:
@@ -140,7 +140,8 @@ def evaluate(x):
             "multipv": info['multipv'],
             "nodes": info['nodes'],
             "time": info['time'],
-            "score": score,
+            # just for pyarrow <3
+            "score": {"moves": score.__dict__.get("moves", 1000), "cp": score.__dict__.get("cp", 0)},
             "winprob": win_chances(score),
             "move": info['pv'][0].uci(),
             "pv": [m.uci() for m in info['pv']],
@@ -341,8 +342,10 @@ def test():
 
   # print(Counter(train['gap_converged_depth']))
   # print(Counter(train['converged_depth']))
+
   def average_precision(scores, labels, reverse=True):
     paired = list(zip(scores, labels))
+
     aps = []
     for seed in range(1000):
       # if there are multiple equivalent scores they need to be shuffled 100 times
@@ -493,7 +496,7 @@ def recursive(x, ind):
   while True:
     eval = evaluate({"FEN": b.fen()})
 
-    # if there are mates, but last not mate is much worse, count as unique 
+    # if there are mates, but last not mate is much worse, count as unique
     is_mate = False
     if eval['second'] and eval['top']['score'] >= Mate(15) and eval['second']['score'] >= Mate(15):
       with chess.engine.SimpleEngine.popen_uci(stockfishpath) as engine:
@@ -502,7 +505,7 @@ def recursive(x, ind):
         scores = [pv["score"].pov(b.turn) for pv in info]
         nmates = sum([s >= Mate(15) for s in scores])
         if nmates >= len(scores):
-          unq = 2.0 
+          unq = 2.0
         else:
           unq = 1 - win_chances(scores[nmates])
         print(f'#0 {nmates=} {scores=} {eval["top"]=} {eval["second"]=}')
@@ -559,20 +562,82 @@ def recursive(x, ind):
     mean_cnts = np.mean(cnts)
 
   return {"uniqueness_recursive": mean_unqs, "counterint_recursive": mean_cnts, "cnts": cnts, "unqs": unqs}
+# ;;
+
+from dataclasses import dataclass
+
+@dataclass
+class Position:
+  fen: str
+  top_move: str
+  eval: dict
+  uniqueness: float
+  metrics: dict
+
+@dataclass
+class Puzzle:
+  positions: list[Position]
+  uniqueness: float
+  metrics: dict
+
+def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
+  b = chess.Board(fen)
+  positions = []
+
+  while True:
+    eval = evaluate({"FEN": b.fen()})
+
+    # if there are mates, but last not mate is much worse, count as unique
+    if eval['second'] and eval['top']['score'].get('moves', np.inf) < 15 and eval['second']['score'].get('moves', np.inf) < 15:
+      with chess.engine.SimpleEngine.popen_uci(stockfishpath) as engine:
+        engine.configure(stockfishcfg)
+        info = engine.analyse(b, limit=stockfish_limit, multipv=32)
+        scores = [pv["score"].pov(b.turn) for pv in info]
+        nmates = sum([s >= Mate(15) for s in scores])
+        if nmates >= len(scores):
+          unq = 2.0
+        else:
+          unq = 1 - win_chances(scores[nmates])
+    elif eval['second']:
+      unq = eval['top']['winprob'] - eval['second']['winprob']
+    else:
+      unq = 2.0
+
+    if unq < uniqueness_threshold:
+      break
+
+    positions.append(Position(fen=b.fen(), top_move=eval['top']['move'], eval=eval, uniqueness=unq, metrics={}))
+    b.push_uci(eval['top']['move'])
+
+    if b.is_game_over():
+      break
+
+    if len(eval['top']['pv']) > 1:
+      b.push_uci(eval['top']['pv'][1])
+    else:
+      with chess.engine.SimpleEngine.popen_uci(stockfishpath) as engine:
+        engine.configure(stockfishcfg)
+        opmove = engine.play(b, limit=stockfish_limit).move.uci()
+        b.push_uci(opmove)
+
+  mean_uniqueness = sum(p.uniqueness for p in positions) / len(positions) if positions else 0.0
+  p = Puzzle(positions=positions or None, uniqueness=mean_uniqueness, metrics={})
+  return p
 
 if __name__ == '__main__':
-  # test_puzzles()
-  # test()
+  train = Dataset.from_json(os.path.expanduser("~/data/puzzle/goldenset-train.jsonl")).select(range(10))
+  train = train.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=10)
 
-  # testing recursive uniqueness
-  # train = Dataset.from_json(os.path.expanduser("~/data/puzzle/goldenset-train.jsonl"))
+  # Dataset.from_list([{"S": []}, {"S": [1]}])
+  # puzzle = fen_to_puzzle(train[0]['FEN'])
+
   # x = {'FEN': '3b2k1/p7/1p4q1/2pNBb2/P1P1pP1p/3rP1P1/5QPK/5R2 b - - 1 40', 'label': 1, 'uniqueness_recursive': 0.0, 'counterint_recursive': 0.0, 'pv': [], 'cnts': [], 'unqs': []}
   # x = train[2]
   # out = recursive(x)
   # out['cnts']
   # print(out)
 
-  test()
+  # test()
 # ;;
 # from matplotlib import pyplot as plt
 # plt.hist(train['converged_depth'])
