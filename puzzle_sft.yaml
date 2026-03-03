@@ -1,0 +1,57 @@
+base_model: Qwen/Qwen3-0.6B
+output_dir: ckpts/06b_puzzle
+
+plugins:
+  - axolotl.integrations.liger.LigerPlugin
+  - axolotl.integrations.cut_cross_entropy.CutCrossEntropyPlugin
+liger_rope: true
+liger_rms_norm: true
+liger_glu_activation: true
+liger_layer_norm: true
+liger_fused_linear_cross_entropy: true
+
+flash_attention: true
+attn_implementation: kernels-community/flash-attn3
+
+sample_packing_bin_size: 50000
+sample_packing_group_size: 5000000
+sample_packing: true
+eval_sample_packing: true
+pad_to_sequence_len: true
+group_by_length: false
+
+dataset_num_proc: 192
+datasets:
+  - path: reciprocate/lichess-puzzles-v0-verbose-mar02
+    type: chat_template
+    split: train
+    field_messages: messages
+    roles_to_train:
+      - assistant
+excess_length_strategy: raise
+val_set_size: 0.01
+evals_per_epoch: 4
+
+sequence_len: 4096
+micro_batch_size: 14
+num_epochs: 1
+gradient_accumulation_steps: 1
+learning_rate: 1e-4
+cosine_min_lr_ratio: 0.1
+lr_scheduler: cosine
+warmup_ratio: 0.01
+max_grad_norm: 1.0
+weight_decay: 0.0
+optimizer: adamw_torch_fused
+bf16: true
+tf32: true
+gradient_checkpointing: false
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+ddp_find_unused_parameters: false
+
+seed: 0
+resume_from_checkpoint:
+saves_per_epoch: 1
+save_only_model: true
+logging_steps: 1
