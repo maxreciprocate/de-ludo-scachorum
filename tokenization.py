@@ -1,3 +1,4 @@
+
 def encode_fen_v0_verbose(fen: str) -> str:
     parts = fen.split()
     active = parts[1]
@@ -76,26 +77,22 @@ def decode_fen_v0_verbose(encoded: str) -> str:
 
     return f"{board_fen} {active} {castling_fen} {en_passant_fen}"
 
+formats = {
+  "v0-verbose": (encode_fen_v0_verbose, decode_fen_v0_verbose),
+}
 
-class BoardFormatting:
-    formats = {
-        "v0-verbose": (encode_fen_v0_verbose, decode_fen_v0_verbose),
-    }
+def encode_fen(fen: str, fmt: str) -> str:
+  return formats[fmt][0](fen)
 
-    @staticmethod
-    def encode_fen(fen: str, fmt: str) -> str:
-        return BoardFormatting.formats[fmt][0](fen)
-
-    @staticmethod
-    def decode_fen(encoded: str, fmt: str) -> str:
-        return BoardFormatting.formats[fmt][1](encoded)
+def decode_fen(encoded: str, fmt: str) -> str:
+  return formats[fmt][1](encoded)
 
 
 if __name__ == "__main__":
     import chess
     from datasets import load_dataset
 
-    test_cases = [
+    test_fens = [
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         "r1bqkb1r/pppp1ppp/2n2n2/4pP2/8/8/PPPPP1PP/RNBQKBNR w KQkq e6 0 4",
         "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R b Kq - 5 20",
@@ -103,17 +100,17 @@ if __name__ == "__main__":
         "8/8/8/4k3/8/8/8/4K3 b - - 99 150",
     ]
     for x in load_dataset("Lichess/chess-puzzles", split="train[:1000]"):
-        test_cases.append(x["FEN"])
+        test_fens.append(x["FEN"])
 
-    for fen in test_cases:
-        encoded = BoardFormatting.encode_fen(fen, "v0-verbose")
-        decoded = BoardFormatting.decode_fen(encoded, "v0-verbose")
+    for fen in test_fens:
+        encoded = encode_fen(fen, "v0-verbose")
+        decoded = decode_fen(encoded, "v0-verbose")
         expected = " ".join(fen.split()[:4])
         assert decoded == expected, f"Round-trip failed: {expected} -> {decoded}"
 
     x = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-    ex = BoardFormatting.encode_fen(x, "v0-verbose")
-    dx = BoardFormatting.decode_fen(ex, "v0-verbose")
+    ex = encode_fen(x, "v0-verbose")
+    dx = decode_fen(ex, "v0-verbose")
 
     print(ex)
     from transformers import AutoTokenizer
