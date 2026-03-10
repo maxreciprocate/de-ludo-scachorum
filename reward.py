@@ -1,5 +1,7 @@
+import fcntl
 import math
 import os
+import traceback
 from collections import Counter
 
 import chess
@@ -17,10 +19,10 @@ from tokenization import decode_fen, encode_fen
 from matplotlib import pyplot as plt
 
 # stockfishpath = os.popen("whereis stockfish").read().split()[1]
-stockfishpath = "/Users/to/pacs/stockfish/stockfish-macos-m1-apple-silicon"
-# stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-avx2"
+# stockfishpath = "/Users/to/pacs/stockfish/stockfish-macos-m1-apple-silicon"
+stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-avx2"
 
-stockfishcfg = {"Threads": 1, "Hash": 2048}
+stockfishcfg = {"Threads": 1, "Hash": 4096}
 stockfish_limit = chess.engine.Limit(nodes=40_000_000, time=40)
 
 def win_chances(score: Score) -> float:
@@ -71,11 +73,28 @@ def load_ref_fens():
 
 load_ref_fens()
 
-def min_fen_distance(fen: str, ref_fens: list[str] = None) -> int:
+EXPANDED_FENS_PATH = "puzzle_expanded_fens.jsonl"
+
+def read_expanded_fens():
+  if not os.path.exists(EXPANDED_FENS_PATH):
+    return []
+  with open(EXPANDED_FENS_PATH, "r") as f:
+    fcntl.flock(f, fcntl.LOCK_SH)
+    fens = [line.strip() for line in f if line.strip()]
+    fcntl.flock(f, fcntl.LOCK_UN)
+  return fens
+
+def append_expanded_fen(expanded_fen: str):
+  with open(EXPANDED_FENS_PATH, "a") as f:
+    fcntl.flock(f, fcntl.LOCK_EX)
+    f.write(expanded_fen + "\n")
+    fcntl.flock(f, fcntl.LOCK_UN)
+
+def min_fen_distance(expanded_fen: str, ref_fens: list[str] = None) -> int:
   if ref_fens is None:
     ref_fens = load_ref_fens()
-  expanded = expand_fen(fen)
-  return min(Levenshtein.distance(expanded, r) for r in ref_fens)
+  # expanded = expand_fen(fen)
+  return min(Levenshtein.distance(expanded_fen, r) for r in ref_fens)
 
 PIECE_VALUES = {
   chess.PAWN: 1,
@@ -149,32 +168,60 @@ def evaluate(x):
 
   return {"evaluation": evaluation, "top": top, "second": second, "max_depth": max_depth}
 
+def is_realistic(board: chess.Board) -> bool:
+  for color in [chess.WHITE, chess.BLACK]:
+    if len(board.pieces(chess.PAWN, color)) > 8: return False
+    if len(board.pieces(chess.QUEEN, color)) > 1: return False
+    if len(board.pieces(chess.ROOK, color)) > 1: return False
+    if len(board.pieces(chess.BISHOP, color)) > 1: return False
+    if len(board.pieces(chess.KNIGHT, color)) > 1: return False
+  return True
+
 def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_info=None, **kwargs):
   tau_unq, tau_cnt = 0.5, 0.1
+  fen_distance_threshold = 6
 
-  print(f'{solution_str=}')
+  fen = decode_fen(solution_str, "v0-verbose")
+  print(f'{fen=}')
+  expanded_fen = expand_fen(fen)
+  puzzle_distance = min_fen_distance(expanded_fen)
 
-  puzzle_distance = min_fen_distance(solution_str)
   invalid = {"score": -2, "counterint": 0, "uniqueness": 0, "penalty": 0, "valid": 0, "is_cnt": 0, "is_unq": 0, "puzzle_distance": puzzle_distance}
 
   try:
-    if not chess.Board(solution_str).is_valid():
+    board = chess.Board(fen)
+    if not board.is_valid():
+      return invalid
+    if not is_realistic(board):
       return invalid
 
-    puzzle = fen_to_puzzle(solution_str)
-    print(f'{puzzle=}')
+    puzzle = fen_to_puzzle(fen)
   except Exception as e:
     print(f"Exception in `compute_score`: {e}")
+    traceback.print_exc()
     return invalid
 
   is_cnt = float(puzzle.metrics['counterint'] > tau_cnt)
   is_unq = float(puzzle.uniqueness > tau_unq)
   score = float(is_unq and is_cnt)
 
-  print(f'{score=}')
-  if score:
-    pprint(f"cnt={puzzle.metrics['counterint']:.2f} [green]✓[/] | unq={puzzle.uniqueness:.2f} [green]✓[/]")
-  return {"score": score, "counterint": puzzle.metrics['counterint'], "uniqueness": puzzle.uniqueness, "penalty": puzzle.metrics['penalty'], "valid": 1, "is_cnt": is_cnt, "is_unq": is_unq, "puzzle_distance": puzzle_distance}
+  # is this to slow to do this on every sample?
+  expanded_fens = read_expanded_fens()
+  batch_fen_distance = min_fen_distance(expanded_fen, expanded_fens)
+  if score == 1:
+    if batch_fen_distance < fen_distance_threshold:
+      print(f"too similar fen: {fen}")
+      score = 0
+    else:
+      append_expanded_fen(expanded_fen)
+      pprint(f"cnt={puzzle.metrics['counterint']:.2f} [green]✓[/] | unq={puzzle.uniqueness:.2f} [green]✓[/]")
+
+  return {"score": score, "counterint": puzzle.metrics['counterint'], "uniqueness": puzzle.uniqueness, "penalty": puzzle.metrics['penalty'], "valid": 1, "is_cnt": is_cnt, "is_unq": is_unq, "puzzle_distance": puzzle_distance, "batch_fen_distance": batch_fen_distance}
+
+def compute_score_uniq(*args, **kwargs):
+  x = compute_score(*args, **kwargs)
+  x['score'] = x['is_unq']
+  return x
 
 def average_precision(scores, labels, reverse=True):
   paired = list(zip(scores, labels))
