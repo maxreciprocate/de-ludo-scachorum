@@ -5,6 +5,19 @@ set -xeuo pipefail
 # export NCCL_IB_HCA=mlx5
 # export UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1
 
+smol_gpu=1
+if [[ $smol_gpu ]]; then
+    gpu_memory_utilization=0.5
+    train_batch_size=16
+    max_reward_proc=1
+else
+    gpu_memory_utilization=0.9
+    train_batch_size=64
+    max_reward_proc=2
+fi
+
+echo $max_reward_proc
+
 export GPUS_PER_NODE=1
 NNODES=${SLURM_JOB_NUM_NODES:-1}
 export NNODES
@@ -22,15 +35,12 @@ loss_mode=gspo
 loss_agg_mode="seq-mean-token-mean"
 rollout_engine=vllm
 rollout_mode=async
-gpu_memory_utilization=0.9
-# reward_manager=dapo
-# reward_manager=batch
+
 adv_estimator=gae
 shuffle_dataset=true
-first_time_dataset_prep=false
 
 test_freq=100
-save_freq=25
+save_freq=-1
 total_epochs=100
 total_training_steps=500
 val_before_train=false
@@ -42,9 +52,8 @@ kl_loss_coef=0.0
 
 clip_ratio_low=0.0003 # as recommended by the paper, see Sec. 5.1
 clip_ratio_high=0.0004 # as recommended by the paper, see Sec. 5.1
-train_batch_size=64
 ppo_mini_batch_size=16 # maintain 4 mini-batches as recommended by the paper, see Sec. 5.1
-ppo_micro_batch_size_per_gpu=8 # setup depending on your GPU memory
+ppo_micro_batch_size_per_gpu=4 # setup depending on your GPU memory
 n_resp_per_prompt=1
 
 max_prompt_length=128
@@ -124,11 +133,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.strategy=fsdp \
     actor_rollout_ref.ref.strategy=fsdp \
     custom_reward_function.path="reward.py" \
-    custom_reward_function.name="compute_score" \
+    custom_reward_function.name="compute_score_uniq" \
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=true \
     actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
+    actor_rollout_ref.rollout.max_model_len=512 \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.top_k=${top_k} \
@@ -142,7 +152,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.entropy_checkpointing=${entropy_checkpointing} \
     reward_model.reward_manager="rate_limited" \
     reward_model.enable=false \
-    +reward.max_concurrent=4 \
+    +reward.max_concurrent=$max_reward_proc \
+    reward.num_workers=4 \
+    reward_model.enable=false \
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
