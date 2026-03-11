@@ -2,18 +2,15 @@ import fcntl
 import math
 import os
 import traceback
-from collections import Counter
 
 import chess
 import chess.engine
 import numpy as np
-from chess import Color, Move
-from chess.engine import Cp, Mate, Score
+from chess import Move
+from chess.engine import Mate, Score
 from datasets import Dataset, concatenate_datasets, load_dataset
 from rapidfuzz.distance import Levenshtein
 from rich import print as pprint
-from tqdm import trange
-from copy import deepcopy
 from dataclasses import asdict, dataclass
 from tokenization import decode_fen, encode_fen
 from matplotlib import pyplot as plt
@@ -23,7 +20,8 @@ from matplotlib import pyplot as plt
 stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-avx2"
 
 stockfishcfg = {"Threads": 1, "Hash": 4096}
-stockfish_limit = chess.engine.Limit(nodes=40_000_000, time=40)
+stockfish_meganodes = int(os.environ.get("STOCKFISH_MEGANODES", 40))
+stockfish_limit = chess.engine.Limit(nodes=stockfish_meganodes * 1_000_000, time=40)
 
 def win_chances(score: Score) -> float:
     """
@@ -64,7 +62,6 @@ def load_ref_fens():
     if os.path.exists(REF_FENS_CACHE_PATH):
       REF_FENS = np.load(REF_FENS_CACHE_PATH, allow_pickle=True)
     else:
-      from datasets import load_dataset
       puzzles = load_dataset("Lichess/chess-puzzles", split="train[:100_000]")
       REF_FENS = np.array([expand_fen(getboard(x).fen()) for x in puzzles])
       os.makedirs(os.path.dirname(REF_FENS_CACHE_PATH), exist_ok=True)
@@ -73,27 +70,35 @@ def load_ref_fens():
 
 load_ref_fens()
 
-EXPANDED_FENS_PATH = "puzzle_expanded_fens.jsonl"
+QUALIFIED_SAMPLES_PATH = "qualified_puzzles.jsonl"
 
-def read_expanded_fens():
-  if not os.path.exists(EXPANDED_FENS_PATH):
+def read_scored_samples() -> list[dict]:
+  import json
+  if not os.path.exists(QUALIFIED_SAMPLES_PATH):
     return []
-  with open(EXPANDED_FENS_PATH, "r") as f:
+  with open(QUALIFIED_SAMPLES_PATH, "r") as f:
     fcntl.flock(f, fcntl.LOCK_SH)
-    fens = [line.strip() for line in f if line.strip()]
+    samples = [json.loads(line) for line in f if line.strip()]
     fcntl.flock(f, fcntl.LOCK_UN)
-  return fens
+  return samples
 
-def append_expanded_fen(expanded_fen: str):
-  with open(EXPANDED_FENS_PATH, "a") as f:
+def append_scored_sample(sample: dict):
+  import json
+  with open(QUALIFIED_SAMPLES_PATH, "a") as f:
     fcntl.flock(f, fcntl.LOCK_EX)
-    f.write(expanded_fen + "\n")
+    f.write(json.dumps(sample) + "\n")
     fcntl.flock(f, fcntl.LOCK_UN)
+
+def min_pv_distance(pv: str, ref_pvs: list[str]) -> float | None:
+  if not ref_pvs:
+    return None
+  return min(Levenshtein.distance(pv, r) / max(len(pv), len(r)) for r in ref_pvs)
 
 def min_fen_distance(expanded_fen: str, ref_fens: list[str] = None) -> int:
   if ref_fens is None:
     ref_fens = load_ref_fens()
-  # expanded = expand_fen(fen)
+  if len(ref_fens) == 0:
+    return None
   return min(Levenshtein.distance(expanded_fen, r) for r in ref_fens)
 
 PIECE_VALUES = {
@@ -180,19 +185,21 @@ def is_realistic(board: chess.Board) -> bool:
 def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_info=None, **kwargs):
   tau_unq, tau_cnt = 0.5, 0.1
   fen_distance_threshold = 6
+  pv_distance_threshold = 0.3
 
   fen = decode_fen(solution_str, "v0-verbose")
-  print(f'{fen=}')
   expanded_fen = expand_fen(fen)
   puzzle_distance = min_fen_distance(expanded_fen)
 
-  invalid = {"score": -2, "counterint": 0, "uniqueness": 0, "penalty": 0, "valid": 0, "is_cnt": 0, "is_unq": 0, "puzzle_distance": puzzle_distance}
+  invalid = {"score": -2, "counterint": 0, "uniqueness": 0, "penalty": 0, "valid": 0, "is_cnt": 0, "is_unq": 0, "puzzle_distance": puzzle_distance, "batch_fen_distance": None, "batch_pv_distance": None}
 
   try:
     board = chess.Board(fen)
     if not board.is_valid():
+      print(f"invalid board: {fen}")
       return invalid
     if not is_realistic(board):
+      print(f"unreal: {fen}")
       return invalid
 
     puzzle = fen_to_puzzle(fen)
@@ -201,26 +208,34 @@ def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_
     traceback.print_exc()
     return invalid
 
+  pv_str = " ".join(puzzle.positions[0].eval['top']['pv'])
+
   is_cnt = float(puzzle.metrics['counterint'] > tau_cnt)
   is_unq = float(puzzle.uniqueness > tau_unq)
-  score = float(is_unq and is_cnt)
 
-  # is this to slow to do this on every sample?
-  expanded_fens = read_expanded_fens()
-  batch_fen_distance = min_fen_distance(expanded_fen, expanded_fens)
+  # for other variants
+  score = float(is_unq and is_cnt) if not kwargs['select_score'] else kwargs['select_score'](is_unq, is_cnt)
+
+  prior_samples = read_scored_samples()
+  prior_fens = [s['expanded_fen'] for s in prior_samples]
+  prior_pvs = [s['pv'] for s in prior_samples]
+  batch_fen_distance = min_fen_distance(expanded_fen, prior_fens)
+  batch_pv_distance = min_pv_distance(pv_str, prior_pvs)
   if score == 1:
-    if batch_fen_distance < fen_distance_threshold:
+    if batch_fen_distance is not None and batch_fen_distance < fen_distance_threshold:
       print(f"too similar fen: {fen}")
       score = 0
+    elif batch_pv_distance is not None and batch_pv_distance < pv_distance_threshold:
+      print(f"too similar pv: {pv_str}")
+      score = 0
     else:
-      append_expanded_fen(expanded_fen)
-      pprint(f"cnt={puzzle.metrics['counterint']:.2f} [green]✓[/] | unq={puzzle.uniqueness:.2f} [green]✓[/]")
+      append_scored_sample({"fen": fen, "expanded_fen": expanded_fen, "pv": pv_str, "score": score, "uniqueness": puzzle.uniqueness, "counterint": puzzle.metrics['counterint'], "batch_fen_distance": batch_fen_distance, "batch_pv_distance": batch_pv_distance})
+      pprint(f"cnt={puzzle.metrics['counterint']:.2f} [green]✓[/] | unq={puzzle.uniqueness:.2f} [green]✓[/] | fen_d={batch_fen_distance} | pv_d={batch_pv_distance}")
 
-  return {"score": score, "counterint": puzzle.metrics['counterint'], "uniqueness": puzzle.uniqueness, "penalty": puzzle.metrics['penalty'], "valid": 1, "is_cnt": is_cnt, "is_unq": is_unq, "puzzle_distance": puzzle_distance, "batch_fen_distance": batch_fen_distance}
+  return {"score": score, "counterint": puzzle.metrics['counterint'], "uniqueness": puzzle.uniqueness, "penalty": puzzle.metrics['penalty'], "valid": 1, "is_cnt": is_cnt, "is_unq": is_unq, "puzzle_distance": puzzle_distance, "batch_fen_distance": batch_fen_distance, "batch_pv_distance": batch_pv_distance}
 
 def compute_score_uniq(*args, **kwargs):
-  x = compute_score(*args, **kwargs)
-  x['score'] = x['is_unq']
+  x = compute_score(*args, **{**kwargs, "select_score": lambda is_unq, is_cnt: float(is_unq)})
   return x
 
 def average_precision(scores, labels, reverse=True):
@@ -301,6 +316,9 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
           unq = 2.0
         else:
           unq = 1 - win_chances(scores[nmates])
+    # if eval['top'] is None:
+    #   # print("****")
+    #   unq =
     elif eval['second']:
       unq = eval['top']['winprob'] - eval['second']['winprob']
     else:
@@ -354,11 +372,26 @@ def test_puzzles():
 
 def test_distance():
   ref_fens = load_ref_fens()
-  print(f"Unique expanded FENs in 100k: {len(set(ref_fens))}")
-
-  from datasets import load_dataset
   puzzles = load_dataset("Lichess/chess-puzzles", split="train[100_000:125_000]")
-  min_fen_distance(puzzles[10]['FEN'])
+  distance = min_fen_distance(expand_fen(puzzles[10]['FEN']))
+  print(f"fen_distance: {distance}")
+
+  assert min_fen_distance("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR", []) is None
+  assert min_fen_distance("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR", ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"]) == 0
+  fd = min_fen_distance("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR", ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"])
+  assert fd > 0, fd
+  print("min_fen_distance ~ all good")
+
+  assert min_pv_distance("e2e4 e7e5", []) is None
+  assert min_pv_distance("e2e4 e7e5", ["e2e4 e7e5"]) == 0.0
+  d = min_pv_distance("e2e4 e7e5 g1f3", ["d2d4 d7d5 c2c4"])
+  assert 0 < d < 1, d
+  d2 = min_pv_distance("e2e4 e7e5 g1f3", ["d2d4 d7d5 c2c4", "e2e4 e7e5 g1f3"])
+  assert d2 == 0.0
+  d3 = min_pv_distance("a1a2", ["h8h7", "a1a2 b1b2"])
+  assert d3 == min_pv_distance("a1a2", ["a1a2 b1b2"])
+  print(f"pv_distance: {d:.3f} {d2:.3f} {d3:.3f}")
+  print("min_pv_distance ~ all good")
 
 def test_goldenset():
   valid = Dataset.from_json(os.path.expanduser("~/data/puzzle/goldenset-valid.jsonl"))
@@ -393,4 +426,5 @@ def test_goldenset():
   plt.show()
 
 if __name__ == '__main__':
-  test_goldenset()
+  # test_goldenset()
+  test_distance()
