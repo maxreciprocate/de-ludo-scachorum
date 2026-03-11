@@ -5,22 +5,24 @@ set -xeuo pipefail
 # export NCCL_IB_HCA=mlx5
 # export UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1
 
+max_reward_proc=`awk '{print int($1/$2/2/8)}' /sys/fs/cgroup/cpu.max`
+echo max_reward_proc=$max_reward_proc
+
 smol_gpu=1
 if [[ $smol_gpu ]]; then
     gpu_memory_utilization=0.5
-    train_batch_size=16
-    max_reward_proc=1
-else
-    gpu_memory_utilization=0.9
     train_batch_size=64
-    max_reward_proc=2
+    reward_func=compute_score
+    export STOCKFISH_MEGANODES=1
+else
+    gpu_memory_utilization=0.95
+    train_batch_size=64
+    reward_func=compute_score_uniq
+    export STOCKFISH_MEGANODES=40
 fi
 
-echo $max_reward_proc
-
-export GPUS_PER_NODE=1
-NNODES=${SLURM_JOB_NUM_NODES:-1}
-export NNODES
+export GPUS_PER_NODE=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+export NNODES=${SLURM_JOB_NUM_NODES:-1}
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export RAY_LOGGING_LEVEL=DEBUG
@@ -39,7 +41,7 @@ rollout_mode=async
 adv_estimator=gae
 shuffle_dataset=true
 
-test_freq=100
+test_freq=-1
 save_freq=-1
 total_epochs=100
 total_training_steps=500
@@ -133,7 +135,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.strategy=fsdp \
     actor_rollout_ref.ref.strategy=fsdp \
     custom_reward_function.path="reward.py" \
-    custom_reward_function.name="compute_score_uniq" \
+    custom_reward_function.name=reward_func \
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=true \
@@ -153,7 +155,7 @@ python3 -m verl.trainer.main_ppo \
     reward_model.reward_manager="rate_limited" \
     reward_model.enable=false \
     +reward.max_concurrent=$max_reward_proc \
-    reward.num_workers=4 \
+    reward.num_workers=8 \
     reward_model.enable=false \
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
