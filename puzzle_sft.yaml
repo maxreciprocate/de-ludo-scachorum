@@ -1,5 +1,5 @@
-base_model: Qwen/Qwen3-0.6B
-output_dir: ckpts/06b_puzzle
+base_model: Qwen/Qwen3-1.7B
+output_dir: ckpts/1b7_puzzle
 
 plugins:
   - axolotl.integrations.liger.LigerPlugin
@@ -33,10 +33,10 @@ val_set_size: 0.01
 evals_per_epoch: 4
 
 sequence_len: 4096
-micro_batch_size: 14
-num_epochs: 1
-gradient_accumulation_steps: 1
-learning_rate: 1e-4
+micro_batch_size: 8
+num_epochs: 2
+gradient_accumulation_steps: 4
+learning_rate: 8e-5
 cosine_min_lr_ratio: 0.1
 lr_scheduler: cosine
 warmup_ratio: 0.01
@@ -52,6 +52,6 @@ ddp_find_unused_parameters: false
 
 seed: 0
 resume_from_checkpoint:
-saves_per_epoch: 1
+saves_per_epoch: 4
 save_only_model: true
 logging_steps: 1
