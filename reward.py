@@ -17,24 +17,25 @@ from matplotlib import pyplot as plt
 
 stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-avx2"
 
-cgroupd = "/sys/fs/cgroup/"
-if os.path.exists(cgroupd+"cpu.max"):
-  with open(cgroupd+"cpu.max") as f:
-    parts = f.read().split()
-    cpu_count = int(parts[0]) // int(parts[1]) // 2
-elif os.path.exists(cgroupd+"cpu/cpu.cfs_quota_us"):
-  with open(cgroupd+"/cpu/cpu.cfs_quota_us") as f:
-    quota = int(f.read().strip())
-  with open(cgroupd+"/cpu/cpu.cfs_period_us") as f:
-    period = int(f.read().strip())
-  if quota > 0:
-    cpu_count = quota // period // 2
+if (cpu_count := os.environ.get("CPU_CORES")) is None:
+  cgroupd = "/sys/fs/cgroup/"
+  if os.path.exists(cgroupd+"cpu.max"):
+    with open(cgroupd+"cpu.max") as f:
+      parts = f.read().split()
+      cpu_count = int(parts[0]) // int(parts[1]) // 2
+  elif os.path.exists(cgroupd+"cpu/cpu.cfs_quota_us"):
+    with open(cgroupd+"/cpu/cpu.cfs_quota_us") as f:
+      quota = int(f.read().strip())
+    with open(cgroupd+"/cpu/cpu.cfs_period_us") as f:
+      period = int(f.read().strip())
+    if quota > 0:
+      cpu_count = quota // period // 2
+    else:
+      cpu_count = os.cpu_count() // 2
   else:
     cpu_count = os.cpu_count() // 2
 else:
-  cpu_count = os.cpu_count() // 2
-
-print(f'{cpu_count=}')
+  cpu_count = int(cpu_count)
 
 stockfishcfg = {"Threads": 1, "Hash": 2048}
 stockfish_meganodes = int(os.environ.get("STOCKFISH_MEGANODES", 40))
@@ -84,6 +85,9 @@ def load_ref_fens():
 load_ref_fens()
 
 QUALIFIED_SAMPLES_PATH = "qualified_puzzles.jsonl"
+
+if os.path.exists(QUALIFIED_SAMPLES_PATH):
+  os.remove(QUALIFIED_SAMPLES_PATH)
 
 def read_scored_samples() -> list[dict]:
   import json
@@ -200,26 +204,32 @@ def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_
   fen_distance_threshold = 6
   pv_distance_threshold = 0.3
 
-  invalid = {"score": -2, "counterint": 0, "uniqueness": 0, "penalty": 0, "valid": 0, "is_cnt": 0, "is_unq": 0, "puzzle_distance": None, "batch_fen_distance": None, "batch_pv_distance": None}
+  invalid = {"score": -2.0, "counterint": 0.0, "uniqueness": 0.0, "penalty": 0.0, "valid": 0, "is_cnt": 0, "is_unq": 0, "puzzle_distance": None, "batch_fen_distance": None, "batch_pv_distance": None}
 
   try:
     fen = decode_fen(solution_str, "v0-verbose")
     board = chess.Board(fen)
+
     if not board.is_valid():
       print(f"invalid board: {fen}")
       return invalid
     if not is_realistic(board):
       print(f"unreal: {fen}")
       return invalid
+    if board.is_checkmate():
+      print(f"already mate: {fen}")
+      return invalid
 
     expanded_fen = expand_fen(fen)
     puzzle_distance = min_fen_distance(expanded_fen)
-
     puzzle = fen_to_puzzle(fen)
 
-    pv_str = " ".join(puzzle.positions[0].eval['top']['pv'])
+    if len(puzzle.positions) == 0:
+      print(f"no positions: {fen}")
+      return invalid
+
   except Exception as e:
-    print(f"Exception in `compute_score`: {e}")
+    print(f"Exception in `compute_score`: {e}\nFEN: {fen}")
     traceback.print_exc()
     return invalid
 
@@ -233,17 +243,18 @@ def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_
   prior_fens = [s['expanded_fen'] for s in prior_samples]
   prior_pvs = [s['pv'] for s in prior_samples]
   batch_fen_distance = min_fen_distance(expanded_fen, prior_fens)
+  pv_str = " ".join(puzzle.positions[0].eval['top']['pv']) if puzzle.positions[0].eval['top'] else ""
   batch_pv_distance = min_pv_distance(pv_str, prior_pvs)
   if score == 1:
     if batch_fen_distance is not None and batch_fen_distance < fen_distance_threshold:
       print(f"too similar fen: {fen}")
-      score = 0
+      score = 0.0
     elif batch_pv_distance is not None and batch_pv_distance < pv_distance_threshold:
       print(f"too similar pv: {pv_str}")
-      score = 0
+      score = 0.0
     else:
       append_scored_sample({"fen": fen, "expanded_fen": expanded_fen, "pv": pv_str, "score": score, "uniqueness": puzzle.uniqueness, "counterint": puzzle.metrics['counterint'], "batch_fen_distance": batch_fen_distance, "batch_pv_distance": batch_pv_distance})
-      pprint(f"cnt={puzzle.metrics['counterint']:.2f} [green]✓[/] | unq={puzzle.uniqueness:.2f} [green]✓[/] | fen_d={f'{batch_fen_distance:.2f}' if batch_fen_distance is not None else None} | pv_d={f'{batch_pv_distance:.2f}' if batch_pv_distance is not None else None}")
+      pprint(f"cnt={puzzle.metrics['counterint']:.2f} [green]✓[/] | unq={puzzle.uniqueness:.2f} [green]✓[/] | fen_d={f'{batch_fen_distance:.2f}' if batch_fen_distance is not None else None} | pv_d={f'{batch_pv_distance:.2f}' if batch_pv_distance is not None else None} | fen={fen}")
 
   return {"score": score, "counterint": puzzle.metrics['counterint'], "uniqueness": puzzle.uniqueness, "penalty": puzzle.metrics['penalty'], "valid": 1, "is_cnt": is_cnt, "is_unq": is_unq, "puzzle_distance": puzzle_distance, "batch_fen_distance": batch_fen_distance, "batch_pv_distance": batch_pv_distance}
 
@@ -316,8 +327,11 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
   b = chess.Board(fen)
   positions = []
 
-  while True:
+  while not b.is_game_over():
     eval = evaluate({"FEN": b.fen()})
+    if eval['top'] is None:
+      print(f"eval.top == None -> {b.fen()}")
+      break
 
     if eval['second'] and 0 < eval['top']['score'].get('moves', np.inf) < 15 and 0 < eval['second']['score'].get('moves', np.inf) < 15:
       with chess.engine.SimpleEngine.popen_uci(stockfishpath) as engine:
@@ -328,7 +342,7 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
         if nmates >= len(scores):
           unq = 2.0
         else:
-          unq = 1 - win_chances(scores[nmates])
+          unq = 1.0 - win_chances(scores[nmates])
     elif eval['second']:
       unq = eval['top']['winprob'] - eval['second']['winprob']
     else:
@@ -339,7 +353,7 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
     depth_cp = min(top_move_pv1_depths, default=1) / stockfish_maxdepth
     pnlt = penalty({"FEN": b.fen()}, top_move)['penalty']
     captured = b.piece_at(chess.Move.from_uci(top_move).to_square)
-    capture_material = -PIECE_VALUES.get(captured.piece_type) / 9.0 if captured else 0.0
+    capture_material = -PIECE_VALUES.get(captured.piece_type, 0) / 9.0 if captured else 0.0
     cint_og = depth_cp * 0.8 + capture_material * 0.1
 
     if unq < uniqueness_threshold:
@@ -360,8 +374,13 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
         opmove = engine.play(b, limit=stockfish_limit).move.uci()
         b.push_uci(opmove)
 
+    if b.is_game_over():
+      break
+
   unique_positions = [p for p in positions if p.is_unique]
   src = unique_positions if unique_positions else positions
+  if not src:
+    return Puzzle(positions=positions, uniqueness=0.0, metrics={"counterint": 0.0, "penalty": 0.0})
   mean_uniqueness = np.mean([p.uniqueness for p in src])
   mean_cint = np.mean([p.metrics["counterint"] for p in src])
   mean_pnlt = np.mean([p.metrics["penalty"] for p in src])
