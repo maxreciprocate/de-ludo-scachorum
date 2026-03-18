@@ -1,4 +1,5 @@
 base_model: Qwen/Qwen3-1.7B
+chat_template_jinja: qwen_no_sys.jinja
 output_dir: ckpts/1b7_puzzle
 
 plugins:
@@ -20,7 +21,7 @@ eval_sample_packing: true
 pad_to_sequence_len: true
 group_by_length: false
 
-dataset_num_proc: 192
+dataset_num_proc: 12
 datasets:
   - path: reciprocate/lichess-puzzles-v0-verbose-mar02
     type: chat_template
@@ -28,15 +29,16 @@ datasets:
     field_messages: messages
     roles_to_train:
       - assistant
+dataset_prepared_path: latest
 excess_length_strategy: raise
 val_set_size: 0.01
-evals_per_epoch: 4
+evals_per_epoch: 8
 
 sequence_len: 4096
-micro_batch_size: 8
-num_epochs: 2
-gradient_accumulation_steps: 4
-learning_rate: 8e-5
+micro_batch_size: 12
+num_epochs: 1
+gradient_accumulation_steps: 1
+learning_rate: 5e-5
 cosine_min_lr_ratio: 0.1
 lr_scheduler: cosine
 warmup_ratio: 0.01
@@ -52,6 +54,6 @@ ddp_find_unused_parameters: false
 
 seed: 0
 resume_from_checkpoint:
-saves_per_epoch: 4
+saves_per_epoch: 8
 save_only_model: true
 logging_steps: 1
