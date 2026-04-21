@@ -16,9 +16,10 @@ from datasets import Dataset, concatenate_datasets
 from jinja2 import Template
 from matplotlib import pyplot as plt
 from PIL import Image
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from reward import (evaluate, fen_to_puzzle, getboard, stockfish_limit,
+from reward import (evaluate, fen_to_puzzle, getboard, penalty, stockfish_limit,
                     stockfishcfg, stockfishpath, win_chances)
 
 textcolor = "#333"
@@ -68,9 +69,6 @@ def create_sample_figure(board, model_top_moves, target_top_moves, step, per_sam
   # plt.close(fig)
   # return img
 
-
-
-
 def generate_all_uci_moves():
     moves = set()
 
@@ -116,7 +114,6 @@ def generate_all_uci_moves():
 
 ALL_UCI_MOVES = generate_all_uci_moves()
 
-
 def format_prompt(b, template):
   legal_moves_uci_list = [move.uci() for move in b.legal_moves]
   legal_moves_uci_str = " ".join(legal_moves_uci_list)
@@ -126,13 +123,56 @@ def format_prompt(b, template):
   inputs = [{"role":"user","content":prompt}]
   return inputs
 
-m = AutoModelForCausalLM.from_pretrained("reciprocate/chess-4b-330m", dtype=torch.float16)
+m = AutoModelForCausalLM.from_pretrained("reciprocate/chess-4b-330m", dtype=torch.float16).to(0)
+m.eval()
 t = AutoTokenizer.from_pretrained("reciprocate/chess-4b-330m")
 template = Template(open("template.jinja").read())
 MOVE_TO_TOKEN = {move: t.encode(move, add_special_tokens=False)[0] for move in ALL_UCI_MOVES}
 
+teacher = AutoModelForCausalLM.from_pretrained("reciprocate/puzzle-1b7-mar17", dtype=torch.float16).to(0)
+teacher.eval()
+teacher_tok = AutoTokenizer.from_pretrained("reciprocate/puzzle-1b7-mar17")
+
+from tokenization import encode_fen
+# ;;
+
+# fen = "8/8/8/4k3/8/8/8/4K3 b - - 99 150"
+# # fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+# fen = "1k1r4/pP2q3/8/Q7/8/6bP/6P1/2R4K w - - 0 1"
+
+# encoded = encode_fen(fen, "v0-verbose")
+# inp = teacher_tok(encoded, return_tensors="pt").to(teacher.device)
+
+# logits = teacher(**inp).logits
+# logprobs = F.log_softmax(logits, dim=-1)
+
+# forseq = logprobs[0, torch.arange(len(inp['input_ids'][0])), inp['input_ids'][0]]
+# forseq.mean()
+
+def add_teacher_prob(ds):
+  new_positions = []
+
+  for x in tqdm(ds):
+    if x['positions']:
+      new_pos = []
+      for p in x['positions']:
+        encoded = encode_fen(p['fen'], "v0-verbose")
+        inp = teacher_tok(encoded, return_tensors="pt").to(teacher.device)
+        logits = teacher(**inp).logits
+
+        probs = F.softmax(logits, dim=-1)
+        logprobs = F.log_softmax(logits, dim=-1)
+
+        entropy = - (probs * logprobs).sum().item()
+        logprob = -logprobs[0, torch.arange(len(inp['input_ids'][0])), inp['input_ids'][0]].mean().item()
+        new_pos.append({**p, "metrics": {"entropy": entropy, "logprob": logprob}})
+    else:
+      new_pos = None
+
+    new_positions.append(new_pos)
+  return ds.remove_columns("positions").add_column("positions", new_positions)
+
 def batch_model_probs(boards, batch_size=32):
-  """Run model inference in batches, return list of softmax prob vectors."""
   all_ps = []
   prompts = []
   for b in boards:
@@ -154,17 +194,21 @@ def batch_model_probs(boards, batch_size=32):
 
 MOVE_TOKEN_IDS = [MOVE_TO_TOKEN[mv] for mv in ALL_UCI_MOVES]
 
-def add_model_probs(ds, batch_size=32):
+def add_student_prob(ds):
   new_positions = []
-  for x in ds:
+  for x in tqdm(ds):
     if x['positions']:
-      boards = [chess.Board(xx['fen']) for xx in x['positions']]
-      ps = batch_model_probs(boards)
-      uci_probs = ps[:, MOVE_TOKEN_IDS].tolist()
-
       new_pos = []
-      for p, uci_ps in zip(x['positions'], uci_probs):
-        new_pos.append({**p, "model_probs": uci_ps})
+      for p in x['positions']:
+        msgs = format_prompt(chess.Board(p['fen']), template)
+        o = t.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+        o += "<uci_move>"
+        inp = t(o, return_tensors='pt').to(m.device)
+        with torch.no_grad():
+          logits = m(**inp, logits_to_keep=1).logits
+        ps = F.softmax(logits[:, -1, :], dim=-1)
+        uci_probs = ps[:, MOVE_TOKEN_IDS].tolist()
+        new_pos.append({**p, "student_probs": uci_probs})
     else:
       new_pos = None
     new_positions.append(new_pos)
@@ -184,31 +228,33 @@ def add_model_probs(ds, batch_size=32):
   #   new_positions.append(pos_list)
   return ds.remove_columns("positions").add_column("positions", new_positions)
 
-# ;; average precision over goldenset
-
-train = Dataset.from_json(os.path.expanduser("~/data/puzzle/goldenset-train.jsonl"))
-# valid = Dataset.from_json(os.path.expanduser("~/data/puzzle/goldenset-valid.jsonl"))
-# train = train.map(lambda x: stockfish_analyse(chess.Board(x["FEN"]).fen()), num_proc=10)
-if __name__ == '__main__':
-  train = train.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=10)
-
-# ;;
-
-train = add_model_probs(train)
-
-# ;;
-
-def compute_counterint_metrics(x):
+def compute_measures(x):
   if x['positions']:
     new_positions = []
     for pos in x['positions']:
       topmove = pos['eval']['top']['move']
-      top_move_prob = pos['model_probs'][ALL_UCI_MOVES.index(topmove)]
-      new_positions.append({**pos, "metrics": {**pos['metrics'], "top_move_prob": top_move_prob}})
+      all_probs = np.array(pos['student_probs'][0])
+      top_move_prob = all_probs[ALL_UCI_MOVES.index(topmove)]
+      top_move_rank = int((all_probs > top_move_prob).sum()) + 1
+      surprise = -np.log(top_move_prob)
+
+      pnt = penalty({"FEN": pos['fen']}, topmove)['penalty']
+
+      m_ = {
+        **pos['metrics'],
+        "top_move_prob": top_move_prob,
+        "top_move_rank": top_move_rank,
+        "surprise": surprise,
+        "penalty": pnt,
+      }
+      new_positions.append({**pos, "metrics": m_})
 
     metrics = {}
     for k in new_positions[0]['metrics']:
-      metrics[k] = np.mean([pos['metrics'][k] for pos in new_positions])
+      if len(new_positions) == 1:
+        metrics[k] = new_positions[0]['metrics'][k]
+      else:
+        metrics[k] = np.mean([pos['metrics'][k] for pos in new_positions if pos['is_unique']])
   else:
     new_positions = None
     metrics = None
@@ -250,17 +296,127 @@ def average_precision(scores, labels):
     aps.append(ap / npos)
   return np.mean(aps)
 
-metrics = train.map(compute_counterint_metrics)
-metrics[0]['positions'][0]['metrics']
+# xs = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-train.jsonl")).select(range(2))
+# xs = xs.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=os.cpu_count() // 2)
+# xs = add_teacher_prob(xs)
+# xs = add_student_prob(xs)
+# xs = xs.map(compute_measures)
+
+import datasets
+train = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-train.jsonl"))
+valid = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-valid.jsonl"))
+intset = Dataset.from_json(os.path.expanduser("~/data/opus/intset-v0.jsonl"))
+
+if __name__ == '__main__':
+  train = train.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=os.cpu_count() // 2)
+  intset = intset.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=os.cpu_count() // 2)
+  valid = valid.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=os.cpu_count() // 2)
+  train = add_student_prob(train)
+  train = add_teacher_prob(train)
+  valid = add_student_prob(valid)
+  valid = add_teacher_prob(valid)
+  intset = add_student_prob(intset)
+  intset = add_teacher_prob(intset)
+
+trainvalid = concatenate_datasets([train, valid])
+train_metrics = train.map(compute_measures)
+valid_metrics = valid.map(compute_measures)
+trainvalid_metrics = trainvalid.map(compute_measures)
+intset_metrics = intset.map(compute_measures)
 
 # ;;
-# ap_kl = average_precision([x for x in metrics['kl']], train['label'])
-ap_top = average_precision([x['top_move_prob'] if x else 0 for x in metrics['metrics']], train['label'])
-# ap_rank = average_precision([x for x in metrics['top_move_rank']], train['label'])
-# ap_diff = average_precision([x for x in metrics['top_move_diff']], train['label'])
-# print(f'AP (KL): {ap_kl:.4f}')
-print(f'AP (top move prob): {ap_top:.4f}')
-# print(f'AP (top move rank): {ap_rank:.4f}')
-# print(f'AP (top move diff): {ap_diff:.4f}')
+imetrics = {
+  "top_move_prob": [-x['top_move_prob'] for x in intset_metrics['metrics']],
+  "top_move_rank": [x['top_move_rank'] for x in intset_metrics['metrics']],
+  "surprise": [x['surprise'] for x in intset_metrics['metrics']],
+  "penalty": [x['penalty'] for x in intset_metrics['metrics']],
+  "surprise+penalty": [x['top_move_rank'] / 1 + x['penalty'] / 10 for x in intset_metrics['metrics']],
+  "top_move_rank+penalty": [x['top_move_rank'] + x['penalty'] for x in intset_metrics['metrics']],
+  "surprise+top_move_rank+penalty": [x['surprise'] + x['top_move_rank'] + x['penalty'] for x in intset_metrics['metrics']],
+  "logprob": intset_metrics['metrics']['logprob'],
+  "entropy": intset_metrics['metrics']['entropy'],
+  "-logprob": [-x['logprob'] for x in intset_metrics['metrics']],
+  "joint": [x['entropy'] + x['surprise'] for x in intset_metrics['metrics']],
+  "-logprob+surprise": [-x['logprob'] + x['surprise'] for x in intset_metrics['metrics']],
+  "entropy+surprise": [x['entropy'] + x['surprise'] for x in intset_metrics['metrics']],
+  "entropy+penalty": [x['entropy'] + x['penalty'] for x in intset_metrics['metrics']],
+  "entropy+top_move_rank": [x['entropy'] + x['top_move_rank'] for x in intset_metrics['metrics']],
+  "entropy+surprise+penalty": [x['entropy'] + x['surprise'] + x['penalty'] for x in intset_metrics['metrics']],
+}
 
-metrics[0]
+for name, scores in imetrics.items():
+  ap = average_precision(scores, intset_metrics['label'])
+  print(f'intset ({name}): {ap:.4f}')
+
+# ;;
+tmetrics = {
+  "top_move_prob": [-x['top_move_prob'] for x in train_metrics['metrics']],
+  "top_move_rank": [x['top_move_rank'] for x in train_metrics['metrics']],
+  "surprise": [x['surprise'] for x in train_metrics['metrics']],
+  "penalty": [x['penalty'] for x in train_metrics['metrics']],
+  "penalty": [x['penalty'] for x in train_metrics['metrics']],
+  "surprise+penalty": [x['top_move_rank'] / 1 + x['penalty'] / 10 for x in train_metrics['metrics']],
+  "top_move_rank+penalty": [x['top_move_rank'] + x['penalty'] for x in train_metrics['metrics']],
+  "surprise+top_move_rank+penalty": [x['surprise'] + x['top_move_rank'] + x['penalty'] for x in train_metrics['metrics']],
+  "-logprob": [-x['logprob'] for x in intset_metrics['metrics']],
+  "entropy": train_metrics['metrics']['entropy'],
+}
+for name, scores in tmetrics.items():
+  ap = average_precision(scores, train_metrics['label'])
+  print(f'train ({name}): {ap:.4f}')
+# ;;
+
+vmetrics = {
+  "top_move_prob": [-x['top_move_prob'] for x in valid_metrics['metrics']],
+  "top_move_rank": [x['top_move_rank'] for x in valid_metrics['metrics']],
+  "surprise": [x['surprise'] for x in valid_metrics['metrics']],
+  "penalty": [x['penalty'] for x in valid_metrics['metrics']],
+  "surprise+penalty": [x['top_move_rank'] / 1 + x['penalty'] / 10 for x in valid_metrics['metrics']],
+  "top_move_rank+penalty": [x['top_move_rank'] + x['penalty'] for x in valid_metrics['metrics']],
+  "surprise+top_move_rank+penalty": [x['surprise'] + x['top_move_rank'] + x['penalty'] for x in valid_metrics['metrics']],
+  "-logprob": [-x['logprob'] for x in intset_metrics['metrics']],
+  "entropy": train_metrics['metrics']['entropy'],
+}
+for name, scores in vmetrics.items():
+  ap = average_precision(scores, valid_metrics['label'])
+  print(f'valid ({name}): {ap:.4f}')
+
+
+tvmetrics = {
+  "top_move_prob": [-x['top_move_prob'] for x in trainvalid_metrics['metrics']],
+  "top_move_rank": [x['top_move_rank'] for x in trainvalid_metrics['metrics']],
+  "surprise": [x['surprise'] for x in trainvalid_metrics['metrics']],
+  "penalty": [x['penalty'] for x in trainvalid_metrics['metrics']],
+  "surprise+penalty": [x['top_move_rank'] / 1 + x['penalty'] / 10 for x in trainvalid_metrics['metrics']],
+  "top_move_rank+penalty": [x['top_move_rank'] + x['penalty'] for x in trainvalid_metrics['metrics']],
+  "surprise+top_move_rank+penalty": [x['surprise'] + x['top_move_rank'] + x['penalty'] for x in trainvalid_metrics['metrics']],
+  "-logprob": [-x['logprob'] for x in intset_metrics['metrics']],
+  "entropy": train_metrics['metrics']['entropy'],
+}
+for name, scores in tvmetrics.items():
+  ap = average_precision(scores, trainvalid_metrics['label'])
+  print(f'trainvalid ({name}): {ap:.4f}')
+
+
+# ;;
+
+# [x['penalty'] for x in metrics['metrics']]
+# [x['top_move_rank'] / 32 for x in metrics['metrics']]
+# fig, ax = plt.subplots(figsize=(12, 6))
+# for label, color in [(0, 'blue'), (1, 'red')]:
+#   idxs = [i for i, l in enumerate(train['label']) if l == label]
+#   vals = [x['metrics']['surprise'] for x in metrics if x['label'] == label]
+#   jitter = np.random.default_rng(0).uniform(-0.2, 0.2, len(vals))
+#   y_pos = label + jitter
+#   ax.scatter(vals, y_pos, alpha=0.6, color=color, s=20, label=f'label={label}')
+#   for i, idx in enumerate(idxs):
+#     ax.annotate(str(idx), (vals[i], y_pos[i]), fontsize=6, alpha=0.7)
+# ax.set_xlabel('top_move_prob')
+# ax.set_yticks([0, 1])
+# ax.set_yticklabels(['label=0', 'label=1'])
+# ax.set_title('Train: prob by label')
+# ax.legend()
+# plt.tight_layout()
+# plt.show()
+
+# ;;
