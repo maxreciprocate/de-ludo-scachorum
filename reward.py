@@ -16,6 +16,7 @@ from tokenization import decode_fen, encode_fen
 from matplotlib import pyplot as plt
 
 stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-avx2"
+# stockfishpath = "/opt/homebrew/bin/stockfish"
 
 if (cpu_count := os.environ.get("CPU_CORES")) is None:
   cgroupd = "/sys/fs/cgroup/"
@@ -87,7 +88,10 @@ load_ref_fens()
 QUALIFIED_SAMPLES_PATH = "qualified_puzzles.jsonl"
 
 if os.path.exists(QUALIFIED_SAMPLES_PATH):
-  os.remove(QUALIFIED_SAMPLES_PATH)
+  try:
+    os.remove(QUALIFIED_SAMPLES_PATH)
+  except Exception:
+    pass
 
 def read_scored_samples() -> list[dict]:
   import json
@@ -204,7 +208,7 @@ def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_
   fen_distance_threshold = 6
   pv_distance_threshold = 0.3
 
-  invalid = {"score": -2.0, "counterint": 0.0, "uniqueness": 0.0, "penalty": 0.0, "valid": 0, "is_cnt": 0, "is_unq": 0, "puzzle_distance": None, "batch_fen_distance": None, "batch_pv_distance": None}
+  invalid = {"score": -2.0, "counterint": 0.0, "uniqueness": 0.0, "penalty": 0.0, "valid": 0.0, "is_cnt": 0.0, "is_unq": 0.0, "puzzle_distance": None, "batch_fen_distance": None, "batch_pv_distance": None, "puzzle": None}
 
   try:
     fen = decode_fen(solution_str, "v0-verbose")
@@ -217,7 +221,7 @@ def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_
       print(f"unreal: {fen}")
       return invalid
     if board.is_checkmate():
-      print(f"already mate: {fen}")
+      print(f"already mated: {fen}")
       return invalid
 
     expanded_fen = expand_fen(fen)
@@ -256,7 +260,7 @@ def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_
       append_scored_sample({"fen": fen, "expanded_fen": expanded_fen, "pv": pv_str, "score": score, "uniqueness": puzzle.uniqueness, "counterint": puzzle.metrics['counterint'], "batch_fen_distance": batch_fen_distance, "batch_pv_distance": batch_pv_distance})
       pprint(f"cnt={puzzle.metrics['counterint']:.2f} [green]✓[/] | unq={puzzle.uniqueness:.2f} [green]✓[/] | fen_d={f'{batch_fen_distance:.2f}' if batch_fen_distance is not None else None} | pv_d={f'{batch_pv_distance:.2f}' if batch_pv_distance is not None else None} | fen={fen}")
 
-  return {"score": score, "counterint": puzzle.metrics['counterint'], "uniqueness": puzzle.uniqueness, "penalty": puzzle.metrics['penalty'], "valid": 1, "is_cnt": is_cnt, "is_unq": is_unq, "puzzle_distance": puzzle_distance, "batch_fen_distance": batch_fen_distance, "batch_pv_distance": batch_pv_distance}
+  return {"score": score, "counterint": puzzle.metrics['counterint'], "uniqueness": puzzle.uniqueness, "penalty": puzzle.metrics['penalty'], "valid": 1.0, "is_cnt": is_cnt, "is_unq": is_unq, "puzzle_distance": puzzle_distance, "batch_fen_distance": batch_fen_distance, "batch_pv_distance": batch_pv_distance, "puzzle": asdict(puzzle)}
 
 def compute_score_uniq(*args, **kwargs):
   x = compute_score(*args, **{**kwargs, "select_score": lambda is_unq, is_cnt: float(is_unq)})
