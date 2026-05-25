@@ -1,4 +1,4 @@
-<img src="./core.png" width="600px"></img>
+<img src="./core.jpg" width="800px"></img>
 
 This is reproduction and extention of <a href="https://sites.google.com/view/puzzle-gen/overview">Generating Creative Chess Puzzles (Deepmind 2025)</a>
 
