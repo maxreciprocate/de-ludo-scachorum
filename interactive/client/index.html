@@ -1,0 +1,253 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>create chess puzzles (if you want)</title>
+  <link rel="stylesheet" href="assets/chessground.base.css">
+  <link rel="stylesheet" href="assets/chessground.cburnett.css">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: "Berkeley Mono", monospace; padding: 20px; font-size: 24px; }
+    .row { display: flex; gap: 12px; align-items: flex-start; justify-content: center; margin-bottom: 24px; }
+    .pos { display: flex; flex-direction: column; align-items: center; }
+    .board { width: 600px; height: 600px; }
+    .label { color: #888; }
+    .arrow { font-size: 34px; color: #999; padding-top: 309px; }
+    .pos > div { text-align: center; }
+    button { font-family: inherit; font-size: 24px; padding: 4px 12px; cursor: pointer; }
+    input { font-family: inherit; font-size: 24px; padding: 4px 8px; width: 80px; }
+    .header { position: relative; display: flex; align-items: center; justify-content: center; gap: 16px; padding: 0 8px 16px; }
+    .header-left { position: absolute; left: 8px; top: 0; display: flex; align-items: center; gap: 8px; }
+    .header-left a { text-decoration: none; color: #333; }
+    .header-left a:hover { text-decoration: underline; }
+    .header-nav { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+    .header-controls { display: flex; align-items: center; gap: 8px; justify-content: center; }
+    #summary { text-align: center; font-size: 26px; padding: 10px 8px; }
+    body.show-hints #hint { background: #d97757; color: #fff; border-color: #d97757; }
+    .turn { width: 24px; height: 24px; border: 1px solid #888; margin-bottom: 8px; }
+    .turn.white { background: #fff; }
+    .turn.black { background: #000; }
+    #summary, .pos > b, .pos > div:not(.board):not(.turn) { visibility: hidden; }
+    .row .pos ~ .pos, .row .arrow { display: none; }
+    body.show-hints #summary,
+    body.show-hints .pos > b { visibility: visible; }
+    body.show-hints .pos > div:not(.board) { visibility: visible; }
+    body.show-hints .row .pos ~ .pos { display: flex; }
+    body.show-hints .row .arrow { display: block; }
+    .metrics { font-size: 26px; padding: 10px 8px; }
+    .fen { color: #555; margin-top: 4px; max-width: 600px; word-break: break-all; text-align: center; background: #f3f3f3; border-radius: 4px; padding: 4px 8px; font-size: 16px; }
+    cg-board {
+      background-color: #fff;
+      background-image: url('data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9Im5vIj8+CjxzdmcgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4bWxuczp4PSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIgogICAgIHZpZXdCb3g9IjAgMCA4IDgiIHNoYXBlLXJlbmRlcmluZz0iY3Jpc3BFZGdlcyI+CjxnIGlkPSJhIj4KICA8ZyBpZD0iYiI+CiAgICA8ZyBpZD0iYyI+CiAgICAgIDxnIGlkPSJkIj4KICAgICAgICA8cmVjdCB3aWR0aD0iMSIgaGVpZ2h0PSIxIiBpZD0iZSIgb3BhY2l0eT0iMCIvPgogICAgICAgIDx1c2UgeD0iMSIgeT0iMSIgaHJlZj0iI2UiIHg6aHJlZj0iI2UiLz4KICAgICAgICA8cmVjdCB5PSIxIiB3aWR0aD0iMSIgaGVpZ2h0PSIxIiBpZD0iZiIgb3BhY2l0eT0iMC4yIi8+CiAgICAgICAgPHVzZSB4PSIxIiB5PSItMSIgaHJlZj0iI2YiIHg6aHJlZj0iI2YiLz4KICAgICAgPC9nPgogICAgICA8dXNlIHg9IjIiIGhyZWY9IiNkIiB4OmhyZWY9IiNkIi8+CiAgICA8L2c+CiAgICA8dXNlIHg9IjQiIGhyZWY9IiNjIiB4OmhyZWY9IiNjIi8+CiAgPC9nPgogIDx1c2UgeT0iMiIgaHJlZj0iI2IiIHg6aHJlZj0iI2IiLz4KPC9nPgo8dXNlIHk9IjQiIGhyZWY9IiNhIiB4OmhyZWY9IiNhIi8+Cjwvc3ZnPg==');
+    }
+  </style>
+</head>
+<body>
+
+
+  <div id="browse-info" style="display:none; text-align:center; padding: 0 8px 16px;">Sorted puzzles by rank out of 100,000 generations done in 20 hours</div>
+  <div id="create-info" style="text-align:center; padding: 0 8px 16px;">Create N puzzles and sort them according to rank measure</div>
+  <div class="header">
+    <div class="header-left">
+      <a href="/">/create</a>
+      <a href="/browse">/browse</a>
+    </div>
+    <div class="header-nav">
+      <div class="header-controls">
+        <input id="n">
+        <button id="create">create</button>
+        <button id="hint">hint</button>
+        <button id="next">next</button>
+      </div>
+      <div id="summary"></div>
+    </div>
+  </div>
+  <div id="grid"></div>
+
+
+  <script type="module">
+   import { Chessground } from './node_modules/@lichess-org/chessground/dist/chessground.js';
+
+   const is_browse_page = location.pathname === '/browse'
+   const boards = []
+
+   function applyHints() {
+       const showing = document.body.classList.contains('show-hints')
+       for (const {cg, shapes} of boards) {
+           cg.set({ drawable: { autoShapes: showing ? shapes : [] } })
+           cg.redrawAll()
+       }
+   }
+
+   document.getElementById('hint').addEventListener('click', () => {
+       document.body.classList.toggle('show-hints')
+       requestAnimationFrame(applyHints)
+   })
+
+   let puzzles = []
+   let current = 0
+
+
+   document.getElementById('next').addEventListener('click', () => {
+
+       if (!puzzles.length) return
+       current = (current + 1) % puzzles.length
+       console.log(current)
+       renderPuzzle(puzzles[current])
+       requestAnimationFrame(applyHints)
+   })
+
+
+   function renderPuzzle(item) {
+       const positions = item.puzzle.positions
+       const grid = document.getElementById('grid')
+       grid.innerHTML = ''
+       boards.length = 0
+       {
+           const row = document.createElement('div')
+           row.className = 'row'
+
+           console.log(item.puzzle.positions)
+
+           positions.forEach((pos, idx) => {
+               if (!pos.is_unique) return
+
+               if (idx > 0) {
+                   const arrow = document.createElement('div')
+                   arrow.className = 'arrow'
+                   arrow.textContent = '⟼'
+                   row.appendChild(arrow)
+               }
+
+               const wrap = document.createElement('div')
+               wrap.className = 'pos'
+
+               const turn = pos.fen.split(' ')[1]
+
+               const turnBox = document.createElement('div')
+               turnBox.className = 'turn ' + (turn === 'b' ? 'black' : 'white')
+               wrap.appendChild(turnBox)
+               const board = document.createElement('div')
+               board.className = 'board'
+               wrap.appendChild(board)
+
+               const evals = pos.eval.evaluation
+               const maxd = Math.max(...evals.map(e => e.depth))
+               const atmax = evals.filter(e => e.depth === maxd)
+               const pv1 = atmax.find(e => e.multipv === 1)
+               const pv2 = atmax.find(e => e.multipv === 2)
+
+               const shapes = []
+               if (pv1) {
+                   shapes.push({
+                       orig: pv1.move.slice(0, 2),
+                       dest: pv1.move.slice(2, 4),
+                       brush: 'green',
+                       modifiers: { lineWidth: 8 },
+                       label: { text: pv1.winprob.toFixed(1) }
+                   })
+               }
+               if (pv2 && pv2.move !== pos.top_student_move) {
+                   shapes.push({
+                       orig: pv2.move.slice(0, 2),
+                       dest: pv2.move.slice(2, 4),
+                       brush: 'red',
+                       modifiers: { lineWidth: 8 },
+                       label: { text: pv2.winprob.toFixed(1) }
+                   })
+               }
+               if (pos.top_student_move && pos.top_student_move !== pv1?.move) {
+                   shapes.push({
+                       orig: pos.top_student_move.slice(0, 2),
+                       dest: pos.top_student_move.slice(2, 4),
+                       brush: 'blue',
+                       modifiers: { lineWidth: 8 },
+                       label: { text: (pos.top_student_move_prob ?? 0).toFixed(2) }
+                   })
+               }
+
+               const cg = Chessground(board, {
+                   fen: pos.fen,
+                   orientation: turn === 'b' ? 'black' : 'white',
+                   coordinatesOnSquares: false,
+                   coordinates: false
+               })
+               boards.push({cg, shapes})
+
+
+               const metrics = document.createElement('div')
+               metrics.className = 'metrics'
+               metrics.innerHTML = Object.entries({rank: pos.top_move_rank, counterint: pos.metrics?.counterint})
+                   .map(([k, v]) => `<span class="label">${k}:</span> ${typeof v === 'number' ? v.toFixed(2) : v}`).join(' ')
+               wrap.appendChild(metrics)
+
+               const fen = document.createElement('div')
+               fen.className = 'fen'
+               fen.textContent = pos.fen
+               wrap.appendChild(fen)
+
+               row.appendChild(wrap)
+           })
+
+           grid.appendChild(row)
+
+           const summary = document.getElementById('summary')
+           const unique = positions.filter(p => p.is_unique)
+           const avg = (xs) => xs.reduce((s, v) => s + v, 0) / xs.length
+           const posAgg = {
+               uniqueness: avg(unique.map(p => p.uniqueness)),
+               ...Object.fromEntries(Object.keys(unique[0]?.metrics).map(k => [k, avg(unique.map(p => p.metrics[k]))]))
+           }
+           const top = {...posAgg, ...item, ...(item.student_metrics)}
+           const keys = [['surprise', 'surprise'], ['top_move_rank', 'rank'], ['top_move_prob', 'top_move_prob'], ['counterint', 'counterint'], ['puzzle_distance', 'puzzle_distance']]
+           summary.innerHTML = keys.filter(([k]) => top[k] !== undefined)
+               .map(([k, label]) => `<span class="label">${label}:</span> ${typeof top[k] === 'number' ? top[k].toFixed(2) : top[k]}`).join(' ')
+
+       }
+   }
+
+   document.getElementById('create').addEventListener('click', () => {
+       const n = parseInt(document.getElementById('n').value)
+       const btn = document.getElementById('create')
+       btn.disabled = true
+
+       const prev = btn.textContent
+       btn.textContent = 'creating...'
+
+       fetch(`create/${n}`)
+           .then(r => r.ok ? r.json() : Promise.reject())
+           .then(data => {
+               puzzles = data
+               current = 0
+               if (puzzles.length) {
+                   console.log(puzzles[current])
+                   renderPuzzle(puzzles[current])
+                   requestAnimationFrame(applyHints)
+               }
+           })
+           .catch(() => {})
+       /* .finally(() => { btn.disabled = false; btn.textContent = prev }) */
+           .finally(() => { btn.disabled = false; btn.textContent = prev })
+   })
+
+   if (is_browse_page) {
+       document.getElementById('n').style.display = 'none'
+       document.getElementById('create').style.display = 'none'
+       document.getElementById('browse-info').style.display = 'block'
+       document.getElementById('create-info').style.display = 'none'
+       fetch('samples.json')
+          .then(r => r.json())
+          .then(data => {
+              /* puzzles = data.map(arr => ({puzzle: {positions: arr}})) */
+              puzzles = data
+              current = 0
+              if (puzzles.length) {
+                  renderPuzzle(puzzles[0])
+                  requestAnimationFrame(applyHints)
+              }
+          })
+   }
+  </script>
+</body>
+</html>
