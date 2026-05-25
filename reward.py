@@ -1,7 +1,9 @@
 import fcntl
 import math
+import sys
 import os
 import traceback
+import uuid
 
 import chess
 import chess.engine
@@ -15,8 +17,11 @@ from dataclasses import asdict, dataclass
 from tokenization import decode_fen, encode_fen
 from matplotlib import pyplot as plt
 
-stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-avx2"
-# stockfishpath = "/opt/homebrew/bin/stockfish"
+match sys.platform:
+  case 'darwin':
+    stockfishpath = "/opt/homebrew/bin/stockfish"
+  case 'linux':
+    stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-avx2"
 
 if (cpu_count := os.environ.get("CPU_CORES")) is None:
   cgroupd = "/sys/fs/cgroup/"
@@ -38,7 +43,7 @@ if (cpu_count := os.environ.get("CPU_CORES")) is None:
 else:
   cpu_count = int(cpu_count)
 
-stockfishcfg = {"Threads": 1, "Hash": 2048}
+stockfishcfg = {"Threads": 1, "Hash": 1024}
 stockfish_meganodes = int(os.environ.get("STOCKFISH_MEGANODES", 40))
 stockfish_maxdepth = 40
 stockfish_limit = chess.engine.Limit(nodes=stockfish_meganodes * 1_000_000, time=40, depth=stockfish_maxdepth)
@@ -59,13 +64,17 @@ def getboard(x):
   return b
 
 def expand_fen(fen: str) -> str:
-  board = fen.split()[0]
-  expanded = ""
-  for c in board:
-    if c.isdigit():
-      expanded += "." * int(c)
-    else:
-      expanded += c
+  try:
+    board = fen.split()[0]
+    expanded = ""
+    for c in board:
+      if c.isdigit():
+        expanded += "." * int(c)
+      else:
+        expanded += c
+  except Exception as e:
+    return str(uuid.uuid1())
+
   return expanded
 
 REF_FENS = None
@@ -211,7 +220,7 @@ def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_
   invalid = {"score": -2.0, "counterint": 0.0, "uniqueness": 0.0, "penalty": 0.0, "valid": 0.0, "is_cnt": 0.0, "is_unq": 0.0, "puzzle_distance": None, "batch_fen_distance": None, "batch_pv_distance": None, "puzzle": None}
 
   try:
-    fen = decode_fen(solution_str, "v0-verbose")
+    fen = decode_fen(solution_str, "v1-nosplit")
     board = chess.Board(fen)
 
     if not board.is_valid():
@@ -337,7 +346,7 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
       print(f"eval.top == None -> {b.fen()}")
       break
 
-    if eval['second'] and 0 < eval['top']['score'].get('moves', np.inf) < 15 and 0 < eval['second']['score'].get('moves', np.inf) < 15:
+    if eval['second'] and 0 < eval['top']['score'].get('moves', np.inf) <= 1 and 0 < eval['second']['score'].get('moves', np.inf) <= 1:
       with chess.engine.SimpleEngine.popen_uci(stockfishpath) as engine:
         engine.configure(stockfishcfg)
         info = engine.analyse(b, limit=stockfish_limit, multipv=32)
@@ -461,5 +470,7 @@ def test_goldenset():
   plt.show()
 
 if __name__ == '__main__':
-  test_goldenset()
+  # test_goldenset()
   # test_distance()
+  x = fen_to_puzzle("8/8/6k1/4q1P1/8/5K2/8/8 b - - 3 3")
+  x.positions[0]

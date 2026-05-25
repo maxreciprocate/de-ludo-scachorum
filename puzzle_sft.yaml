@@ -1,6 +1,6 @@
-base_model: Qwen/Qwen3-1.7B
+base_model: Qwen/Qwen3-4B
 chat_template_jinja: qwen_no_sys.jinja
-output_dir: ckpts/1b7_puzzle
+output_dir: ckpts/4b_puzzle
 
 plugins:
   - axolotl.integrations.liger.LigerPlugin
@@ -21,9 +21,9 @@ eval_sample_packing: true
 pad_to_sequence_len: true
 group_by_length: false
 
-dataset_num_proc: 12
+dataset_num_proc: 24
 datasets:
-  - path: reciprocate/lichess-puzzles-v0-verbose-mar02
+  - path: reciprocate/lichess-puzzles-v1-nosplit-apr23
     type: chat_template
     split: train
     field_messages: messages
@@ -31,11 +31,11 @@ datasets:
       - assistant
 dataset_prepared_path: latest
 excess_length_strategy: raise
-val_set_size: 0.01
+val_set_size: 0.001
 evals_per_epoch: 8
 
 sequence_len: 4096
-micro_batch_size: 12
+micro_batch_size: 2
 num_epochs: 1
 gradient_accumulation_steps: 1
 learning_rate: 5e-5
@@ -54,6 +54,6 @@ ddp_find_unused_parameters: false
 
 seed: 0
 resume_from_checkpoint:
-saves_per_epoch: 8
+saves_per_epoch: 1
 save_only_model: true
 logging_steps: 1

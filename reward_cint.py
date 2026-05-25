@@ -163,7 +163,7 @@ def add_teacher_prob(ds):
         probs = F.softmax(logits, dim=-1)
         logprobs = F.log_softmax(logits, dim=-1)
 
-        entropy = - (probs * logprobs).sum().item()
+        entropy = -(probs * logprobs).sum().item()
         logprob = -logprobs[0, torch.arange(len(inp['input_ids'][0])), inp['input_ids'][0]].mean().item()
         new_pos.append({**p, "metrics": {"entropy": entropy, "logprob": logprob}})
     else:
@@ -171,26 +171,6 @@ def add_teacher_prob(ds):
 
     new_positions.append(new_pos)
   return ds.remove_columns("positions").add_column("positions", new_positions)
-
-def batch_model_probs(boards, batch_size=32):
-  all_ps = []
-  prompts = []
-  for b in boards:
-    msgs = format_prompt(b, template)
-    o = t.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
-    o += "<uci_move>"
-    prompts.append(o)
-
-  t.padding_side = "left"
-  t.pad_token = t.eos_token
-  for i in range(0, len(prompts), batch_size):
-    batch = prompts[i:i+batch_size]
-    inputs = t(batch, return_tensors='pt', padding=True).to(m.device)
-    with torch.no_grad():
-      logits = m(**inputs, logits_to_keep=1).logits
-    ps = F.softmax(logits[:, -1, :], dim=-1)
-    all_ps.append(ps.cpu())
-  return torch.cat(all_ps, dim=0)
 
 MOVE_TOKEN_IDS = [MOVE_TO_TOKEN[mv] for mv in ALL_UCI_MOVES]
 
@@ -247,9 +227,10 @@ def compute_measures(x):
         "surprise": surprise,
         "penalty": pnt,
       }
+      # i mean :::
       new_positions.append({**pos, "metrics": m_})
 
-    metrics = {}
+    metrics = x['metrics']
     for k in new_positions[0]['metrics']:
       if len(new_positions) == 1:
         metrics[k] = new_positions[0]['metrics'][k]
@@ -295,58 +276,77 @@ def average_precision(scores, labels):
         ap += tp / (k + 1)
     aps.append(ap / npos)
   return np.mean(aps)
+# ;;
 
-# xs = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-train.jsonl")).select(range(2))
+# xs = Dataset.from_list([{"FEN": "8/p2p1k2/bp5p/nNqPPp1N/5P2/P2Q4/6P1/4K3 b - - 0 1"}])
+# # xs = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-train.jsonl")).select(range(2))
 # xs = xs.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=os.cpu_count() // 2)
 # xs = add_teacher_prob(xs)
 # xs = add_student_prob(xs)
-# xs = xs.map(compute_measures)
+# xs.map(compute_measures)
+# ;;
 
 import datasets
 train = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-train.jsonl"))
 valid = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-valid.jsonl"))
-intset = Dataset.from_json(os.path.expanduser("~/data/opus/intset-v0.jsonl"))
+# intset = Dataset.from_json(os.path.expanduser("~/data/opus/intset-v1.jsonl"))
 
 if __name__ == '__main__':
   train = train.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=os.cpu_count() // 2)
-  intset = intset.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=os.cpu_count() // 2)
   valid = valid.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=os.cpu_count() // 2)
+  # intset = intset.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=32)
   train = add_student_prob(train)
   train = add_teacher_prob(train)
   valid = add_student_prob(valid)
   valid = add_teacher_prob(valid)
-  intset = add_student_prob(intset)
-  intset = add_teacher_prob(intset)
+  # intset = add_student_prob(intset)
+  # intset = add_teacher_prob(intset)
 
 trainvalid = concatenate_datasets([train, valid])
 train_metrics = train.map(compute_measures)
 valid_metrics = valid.map(compute_measures)
 trainvalid_metrics = trainvalid.map(compute_measures)
-intset_metrics = intset.map(compute_measures)
+# intset_metrics = intset.map(compute_measures)
+
+# print(f'{intset_metrics[0].keys()=}')
+# print(f'{intset_metrics[0]["metrics"].keys()=}')
 
 # ;;
-imetrics = {
-  "top_move_prob": [-x['top_move_prob'] for x in intset_metrics['metrics']],
-  "top_move_rank": [x['top_move_rank'] for x in intset_metrics['metrics']],
-  "surprise": [x['surprise'] for x in intset_metrics['metrics']],
-  "penalty": [x['penalty'] for x in intset_metrics['metrics']],
-  "surprise+penalty": [x['top_move_rank'] / 1 + x['penalty'] / 10 for x in intset_metrics['metrics']],
-  "top_move_rank+penalty": [x['top_move_rank'] + x['penalty'] for x in intset_metrics['metrics']],
-  "surprise+top_move_rank+penalty": [x['surprise'] + x['top_move_rank'] + x['penalty'] for x in intset_metrics['metrics']],
-  "logprob": intset_metrics['metrics']['logprob'],
-  "entropy": intset_metrics['metrics']['entropy'],
-  "-logprob": [-x['logprob'] for x in intset_metrics['metrics']],
-  "joint": [x['entropy'] + x['surprise'] for x in intset_metrics['metrics']],
-  "-logprob+surprise": [-x['logprob'] + x['surprise'] for x in intset_metrics['metrics']],
-  "entropy+surprise": [x['entropy'] + x['surprise'] for x in intset_metrics['metrics']],
-  "entropy+penalty": [x['entropy'] + x['penalty'] for x in intset_metrics['metrics']],
-  "entropy+top_move_rank": [x['entropy'] + x['top_move_rank'] for x in intset_metrics['metrics']],
-  "entropy+surprise+penalty": [x['entropy'] + x['surprise'] + x['penalty'] for x in intset_metrics['metrics']],
-}
+# imetrics = {
+#   "uniqueness": [x["uniqueness"] for x in intset_metrics],
+#   "counterint": [x["counterint"] for x in intset_metrics['metrics']],
+#   "top_move_prob": [-x['top_move_prob'] for x in intset_metrics['metrics']],
+#   "top_move_rank": [x['top_move_rank'] for x in intset_metrics['metrics']],
+#   "surprise": [x['surprise'] for x in intset_metrics['metrics']],
+#   "penalty": [x['penalty'] for x in intset_metrics['metrics']],
+#   "surprise+penalty": [x['top_move_rank'] / 1 + x['penalty'] / 10 for x in intset_metrics['metrics']],
+#   "top_move_rank+penalty": [x['top_move_rank'] + x['penalty'] for x in intset_metrics['metrics']],
+#   "logprob": intset_metrics['metrics']['logprob'],
+#   "entropy": intset_metrics['metrics']['entropy'],
+#   "-logprob": [-x['logprob'] for x in intset_metrics['metrics']],
+#   "joint": [-x['entropy'] + x['surprise'] for x in intset_metrics['metrics']],
+#   "-logprob+surprise": [-x['logprob'] + x['surprise'] for x in intset_metrics['metrics']],
+#   "entropy+surprise": [x['entropy'] + x['surprise'] for x in intset_metrics['metrics']],
+#   "entropy+penalty": [x['entropy'] + x['penalty'] for x in intset_metrics['metrics']],
+# }
 
-for name, scores in imetrics.items():
-  ap = average_precision(scores, intset_metrics['label'])
-  print(f'intset ({name}): {ap:.4f}')
+# from rich.table import Table
+# from rich.console import Console
+
+# results = []
+# for name, scores in imetrics.items():
+#   ap = average_precision(scores, intset_metrics['label'])
+#   results.append((name, ap))
+
+# results.sort(key=lambda x: x[1], reverse=True)
+
+# table = Table(title="intset")
+# table.add_column("metric")
+# table.add_column("AP", justify="right")
+# for name, ap in results:
+#   table.add_row(name, f"{ap:.4f}")
+
+# Console().print(table)
 
 # ;;
 tmetrics = {
@@ -358,13 +358,13 @@ tmetrics = {
   "surprise+penalty": [x['top_move_rank'] / 1 + x['penalty'] / 10 for x in train_metrics['metrics']],
   "top_move_rank+penalty": [x['top_move_rank'] + x['penalty'] for x in train_metrics['metrics']],
   "surprise+top_move_rank+penalty": [x['surprise'] + x['top_move_rank'] + x['penalty'] for x in train_metrics['metrics']],
-  "-logprob": [-x['logprob'] for x in intset_metrics['metrics']],
+  "-logprob": [-x['logprob'] for x in train_metrics['metrics']],
+  "-logprob+surprise": [-x['logprob'] + x['surprise'] for x in train_metrics['metrics']],
   "entropy": train_metrics['metrics']['entropy'],
 }
 for name, scores in tmetrics.items():
   ap = average_precision(scores, train_metrics['label'])
   print(f'train ({name}): {ap:.4f}')
-# ;;
 
 vmetrics = {
   "top_move_prob": [-x['top_move_prob'] for x in valid_metrics['metrics']],
@@ -374,7 +374,8 @@ vmetrics = {
   "surprise+penalty": [x['top_move_rank'] / 1 + x['penalty'] / 10 for x in valid_metrics['metrics']],
   "top_move_rank+penalty": [x['top_move_rank'] + x['penalty'] for x in valid_metrics['metrics']],
   "surprise+top_move_rank+penalty": [x['surprise'] + x['top_move_rank'] + x['penalty'] for x in valid_metrics['metrics']],
-  "-logprob": [-x['logprob'] for x in intset_metrics['metrics']],
+  "-logprob": [-x['logprob'] for x in valid_metrics['metrics']],
+  "-logprob+surprise": [-x['logprob'] + x['surprise'] for x in valid_metrics['metrics']],
   "entropy": train_metrics['metrics']['entropy'],
 }
 for name, scores in vmetrics.items():
@@ -390,7 +391,8 @@ tvmetrics = {
   "surprise+penalty": [x['top_move_rank'] / 1 + x['penalty'] / 10 for x in trainvalid_metrics['metrics']],
   "top_move_rank+penalty": [x['top_move_rank'] + x['penalty'] for x in trainvalid_metrics['metrics']],
   "surprise+top_move_rank+penalty": [x['surprise'] + x['top_move_rank'] + x['penalty'] for x in trainvalid_metrics['metrics']],
-  "-logprob": [-x['logprob'] for x in intset_metrics['metrics']],
+  "-logprob": [-x['logprob'] for x in trainvalid_metrics['metrics']],
+  "-logprob+surprise": [-x['logprob'] + x['surprise'] for x in trainvalid_metrics['metrics']],
   "entropy": train_metrics['metrics']['entropy'],
 }
 for name, scores in tvmetrics.items():

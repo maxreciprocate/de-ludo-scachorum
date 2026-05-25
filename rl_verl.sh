@@ -5,23 +5,43 @@ set -xeuo pipefail
 # export NCCL_IB_HCA=mlx5
 # export UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1
 
-max_reward_proc=`awk '{print int($1/$2/2/8)}' /sys/fs/cgroup/cpu.max`
-echo max_reward_proc=$max_reward_proc
-
-smol_gpu=1
-if [[ $smol_gpu ]]; then
-    gpu_memory_utilization=0.5
-    train_batch_size=64
-    reward_func=compute_score
-    export STOCKFISH_MEGANODES=1
+if [[ -f /sys/fs/cgroup/cpu.max ]]; then
+    read -r quota period < /sys/fs/cgroup/cpu.max
+    if [[ "$quota" == "max" ]]; then
+        cpu_count=$(( $(nproc) / 2 ))
+    else
+        cpu_count=$(( quota / period / 2 ))
+    fi
+elif [[ -f /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]]; then
+    quota=$(< /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
+    period=$(< /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+    if (( quota > 0 )); then
+        cpu_count=$(( quota / period / 2 ))
+    else
+        cpu_count=$(( $(nproc) / 2 ))
+    fi
 else
-    gpu_memory_utilization=0.95
+    cpu_count=$(( $(nproc) / 2 ))
+fi
+
+max_reward_cpu=$(($cpu_count / 8))
+
+smol_gpu=0
+if (( $smol_gpu )); then
+    gpu_memory_utilization=0.6
     train_batch_size=64
     reward_func=compute_score_uniq
+    export STOCKFISH_MEGANODES=1
+else
+    gpu_memory_utilization=0.8
+    train_batch_size=1024
+    reward_func=compute_score
     export STOCKFISH_MEGANODES=40
 fi
 
-export GPUS_PER_NODE=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+# who unsets visible devices
+export GPUS_PER_NODE=$(python -c "import torch; print(torch.cuda.device_count())")
+echo GPUS_PER_NODE=$GPUS_PER_NODE
 export NNODES=${SLURM_JOB_NUM_NODES:-1}
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
@@ -35,8 +55,6 @@ MODEL_PATH=reciprocate/puzzle-0b6-mar03
 
 loss_mode=gspo
 loss_agg_mode="seq-mean-token-mean"
-rollout_engine=vllm
-rollout_mode=async
 
 adv_estimator=gae
 shuffle_dataset=true
@@ -44,18 +62,18 @@ shuffle_dataset=true
 test_freq=-1
 save_freq=-1
 total_epochs=100
-total_training_steps=500
+total_training_steps=1000
 val_before_train=false
 
 use_kl_in_reward=false
-kl_coef=0.00
+kl_coef=0.01
 use_kl_loss=false
 kl_loss_coef=0.0
 
 clip_ratio_low=0.0003 # as recommended by the paper, see Sec. 5.1
 clip_ratio_high=0.0004 # as recommended by the paper, see Sec. 5.1
-ppo_mini_batch_size=16 # maintain 4 mini-batches as recommended by the paper, see Sec. 5.1
-ppo_micro_batch_size_per_gpu=4 # setup depending on your GPU memory
+ppo_mini_batch_size=$((train_batch_size/4)) # maintain 4 mini-batches as recommended by the paper, see Sec. 5.1
+ppo_micro_batch_size_per_gpu=16 # setup depending on your GPU memory
 n_resp_per_prompt=1
 
 max_prompt_length=128
@@ -118,8 +136,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.agent.num_workers=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.name=${rollout_engine} \
-    actor_rollout_ref.rollout.mode=${rollout_mode} \
+    actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=false \
     actor_rollout_ref.actor.optim.lr=1e-5 \
@@ -129,13 +146,13 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
-    actor_rollout_ref.actor.entropy_coeff=0.00 \
+    actor_rollout_ref.actor.entropy_coeff=0.01 \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.strategy=fsdp \
     actor_rollout_ref.ref.strategy=fsdp \
     custom_reward_function.path="reward.py" \
-    custom_reward_function.name=reward_func \
+    custom_reward_function.name=$reward_func \
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=true \
@@ -154,7 +171,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.entropy_checkpointing=${entropy_checkpointing} \
     reward_model.reward_manager="rate_limited" \
     reward_model.enable=false \
-    +reward.max_concurrent=$max_reward_proc \
+    +reward.max_concurrent=$max_reward_cpu \
     reward.num_workers=8 \
     reward_model.enable=false \
     trainer.logger='["console","wandb"]' \

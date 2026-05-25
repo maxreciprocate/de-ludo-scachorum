@@ -1,6 +1,6 @@
 import chess
 from datasets import Dataset, DatasetDict, load_dataset
-from tokenization import BoardFormatting
+from tokenization import encode_fen
 from transformers import AutoTokenizer
 import datasets
 datasets.disable_caching()
@@ -16,7 +16,7 @@ def nowdate():
   import datetime
   return datetime.datetime.now().strftime("%b%d").lower()
 
-fmt = "v0-verbose"
+fmt = "v1-nosplit"
 xs = load_dataset("Lichess/chess-puzzles", split="train")
 
 def getposfen(x):
@@ -24,7 +24,7 @@ def getposfen(x):
   head, *_ = x["Moves"].split()
   b.push(chess.Move.from_uci(head))
   fen = b.fen()
-  out = BoardFormatting.encode_fen(fen, fmt)
+  out = encode_fen(fen, fmt)
   return out
 
 xs = xs.train_test_split(test_size=200_000, seed=0)

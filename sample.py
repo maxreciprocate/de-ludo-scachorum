@@ -8,6 +8,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import asyncio
+from dataclasses import asdict, dataclass
 
 import openai
 import yaml
@@ -24,13 +25,12 @@ from uuid import uuid4
 console = Console(width=80 if 'ipykernel' in sys.modules else 160)
 client = openai.OpenAI(base_url="http://localhost:8000/v1/", api_key="none")
 
-from reward import reward_fn, compute_score, expand_fen, min_fen_distance
+from reward import compute_score, expand_fen, min_fen_distance, cpu_count, fen_to_puzzle
 from datasets import Dataset
 import numpy as np
 
 def postprocess_to_save(messages):
     return [m if isinstance(m, dict) else m.to_dict() for m in messages]
-
 
 def print_messages(messages, index=None):
     if index is not None:
@@ -151,22 +151,25 @@ if __name__ == '__main__':
   args = parser.parse_args()
 
   prompts = [[{"role": "user", "content": "Generate a chess puzzle."}] for _ in range(args.n)]
-  outputs = generate(args.model, prompts, temperature=args.temperature, top_p=args.top_p)
+  # prompts = [[{"role": "user", "content": "Create a chess puzzle"}] for _ in range(args.n)]
+  outputs = generate(args.model, prompts, temperature=args.temperature, top_p=args.top_p, max_tokens=512)
   from tokenization import decode_fen
-  print(outputs[0])
-  outputs = [{"FEN": decode_fen(x[-1]['content'], "v0-verbose")} for x in outputs]
-  print(outputs[:8])
-  xs = Dataset.from_list(outputs)
-
-  xs = xs.map(lambda x: compute_score(None, x["FEN"], None), num_proc=os.cpu_count() // 4)
+  # print(outputs[0])
+  # outputs = [{"FEN": decode_fen(x[-1]['content'], "v0-verbose")} for x in outputs]
+  # print(outputs[:8])
+  xs = Dataset.from_list([{"solution_str": x[-1]['content'].split("</think>")[-1].strip()} for x in outputs])
+  print(xs[0])
+  xs = xs.map(lambda x: {k: v for k, v in compute_score(None, x['solution_str'], None).items() if k != 'puzzle'}, num_proc=cpu_count)
+  # xs = xs.map(lambda x: asdict(fen_to_puzzle(decode_fen(x['solution_str'], "v0-verbose"))), num_proc=cpu_count)
   print(xs[0])
   os.makedirs("artifacts", exist_ok=True)
   path = f"artifacts/{args.model.split('/')[-1]}-{len(xs)}n.parquet"
   xs.to_parquet(path)
   print(path)
 
-  fens = set([expand_fen(x['FEN']) for x in xs])
-  self_distance = np.mean([min_fen_distance(f, fens - {f}) for f in fens])
+  fens = set([expand_fen(decode_fen(x['solution_str'], "v1-nosplit")) for x in xs])
+  pair_distances = [d for d in (min_fen_distance(f, fens - {f}) for f in fens) if d is not None]
+  self_distance = float(np.mean(pair_distances)) if pair_distances else 0.0
   is_puzzle = np.mean([float(x['is_cnt'] and x['is_unq']) for x in xs])
 
   bool_metrics = ['valid', 'is_cnt', 'is_unq', 'score']
@@ -240,6 +243,3 @@ if __name__ == '__main__':
 
   print(",".join(header))
   print(",".join(values))
-
-
-
