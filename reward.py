@@ -2,6 +2,7 @@ import fcntl
 import math
 import sys
 import os
+import json
 import traceback
 import uuid
 
@@ -14,7 +15,6 @@ from datasets import Dataset, concatenate_datasets, load_dataset
 from rapidfuzz.distance import Levenshtein
 from rich import print as pprint
 from dataclasses import asdict, dataclass
-from tokenization import decode_fen, encode_fen
 from matplotlib import pyplot as plt
 
 match sys.platform:
@@ -103,7 +103,6 @@ if os.path.exists(QUALIFIED_SAMPLES_PATH):
     pass
 
 def read_scored_samples() -> list[dict]:
-  import json
   if not os.path.exists(QUALIFIED_SAMPLES_PATH):
     return []
   with open(QUALIFIED_SAMPLES_PATH, "r") as f:
@@ -212,17 +211,15 @@ def is_realistic(board: chess.Board) -> bool:
     if len(board.pieces(chess.KNIGHT, color)) > 2: return False
   return True
 
-def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_info=None, **kwargs):
+def reward(fen, **kwargs):
   tau_unq, tau_cnt = 0.5, 0.1
   fen_distance_threshold = 6
   pv_distance_threshold = 0.3
 
   invalid = {"score": -2.0, "counterint": 0.0, "uniqueness": 0.0, "penalty": 0.0, "valid": 0.0, "is_cnt": 0.0, "is_unq": 0.0, "puzzle_distance": None, "batch_fen_distance": None, "batch_pv_distance": None, "puzzle": None}
 
+  board = chess.Board(fen)
   try:
-    fen = decode_fen(solution_str, "v1-nosplit")
-    board = chess.Board(fen)
-
     if not board.is_valid():
       print(f"invalid board: {fen}")
       return invalid
@@ -242,7 +239,7 @@ def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_
       return invalid
 
   except Exception as e:
-    print(f"Exception in `compute_score`: {e}\nFEN: {fen}")
+    print(f"Exception in `reward`: {e}\nFEN: {fen}")
     traceback.print_exc()
     return invalid
 
@@ -271,8 +268,8 @@ def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_
 
   return {"score": score, "counterint": puzzle.metrics['counterint'], "uniqueness": puzzle.uniqueness, "penalty": puzzle.metrics['penalty'], "valid": 1.0, "is_cnt": is_cnt, "is_unq": is_unq, "puzzle_distance": puzzle_distance, "batch_fen_distance": batch_fen_distance, "batch_pv_distance": batch_pv_distance, "puzzle": asdict(puzzle)}
 
-def compute_score_uniq(*args, **kwargs):
-  x = compute_score(*args, **{**kwargs, "select_score": lambda is_unq, is_cnt: float(is_unq)})
+def reward_uniq(*args, **kwargs):
+  x = reward(*args, **{**kwargs, "select_score": lambda is_unq, is_cnt: float(is_unq)})
   return x
 
 def average_precision(scores, labels, reverse=True):
@@ -402,7 +399,7 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
 def test_puzzles():
   from datasets import load_dataset
   xs = load_dataset("Lichess/chess-puzzles", split="train[:2500]")
-  xs = xs.map(lambda x: compute_score(None, getboard(x).fen(), None), num_proc=cpu_count)
+  xs = xs.map(lambda x: reward(getboard(x)), num_proc=cpu_count)
 
   is_unq_count = sum(xs['is_unq'])
   is_cnt_count = sum(xs['is_cnt'])
