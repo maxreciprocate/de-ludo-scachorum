@@ -14,7 +14,7 @@ from kernels import get_kernel
 from matplotlib import pyplot
 from safetensors import safe_open
 from safetensors.torch import save_file
-from torch.nn import Embedding, Linear, RMSNorm
+from torch.nn import Embedding, RMSNorm
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from torch.utils.data import TensorDataset
@@ -31,7 +31,7 @@ PIECE_MAP = {
 }
 
 def encode(board):
-  # <bos> + 64 + <W|B>
+  # <bos> + 64 + <w|b>
   tokens = torch.zeros(66, dtype=torch.long)
   tokens[0] = 13
   tokens[-1] = 14 if board.turn == chess.WHITE else 15
@@ -78,10 +78,25 @@ valid_tokens = torch.tensor(valid['tokens'], dtype=torch.long)
 
 print(f'{len(train_tokens) / 1e6:.1f}M train size, {len(valid_tokens) / 1e6:.1f}M valid size')
 
+train_tokens.numel() * train_tokens.element_size() >> 20
 # ;;
 
 kernel_module = get_kernel("kernels-community/flash-attn2", version=1)
+# kernel_module = get_kernel("kernels-community/flash-attn4", version=0)
 flash_attn_func = kernel_module.flash_attn_func
+DTYPE = torch.bfloat16
+DEV = torch.device(0)
+
+from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import create_block_mask
+
+def causal(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
+
+block_mask = create_block_mask(causal, B=None, H=4, Q_LEN=4, KV_LEN=4)
+create_block_mask = torch.compile(create_block_mask)
+# block_mask = torch.compile(block_mask)
+flex_attention = torch.compile(flex_attention, dynamic=False)
 
 @dataclass
 class Config:
@@ -93,6 +108,10 @@ class Config:
 
 def norm(x):
   return F.rms_norm(x, (x.size(-1),))
+
+class Linear(nn.Linear):
+    def forward(self, x):
+        return F.linear(x, self.weight.to(dtype=x.dtype))
 
 class MLP(nn.Module):
   def __init__(self, cfg):
@@ -121,6 +140,8 @@ class MHA(nn.Module):
     k = self.k(x).view(B, T, self.cfg.heads, D // self.cfg.heads)
     v = self.v(x).view(B, T, self.cfg.heads, D // self.cfg.heads)
     y = flash_attn_func(q, k, v, causal=True)
+    # y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask).transpose(1, 2)
+    # y = flex_attention(q, k, v, block_mask=block_mask)
     y = y.contiguous().view(B, T, D)
     y = self.o(y)
     return y
@@ -149,9 +170,12 @@ class Picoformer(nn.Module):
     B, T = x.shape
     pos = torch.arange(T, device=x.device)
     x = self.embd(x) + self.pos_embd(pos)
+    x = x.to(DTYPE)
     for f in self.layers:
       x = f(x)
-    x = self.lm_head(norm(x))
+    x = self.lm_head(norm(x)).float()
+    softcap = 15
+    x = softcap * torch.tanh(x / softcap)
     if labels is not None:
       return F.cross_entropy(x.view(-1, x.size(-1)), labels.view(-1), ignore_index=-1)
     return x
@@ -186,44 +210,61 @@ class Picoformer(nn.Module):
     return x
 
 cfg = Config()
+cfg = Config(dim=256, layers=16)
 m = Picoformer(cfg)
 # m.init_weights()
+size = f'{sum(p.numel() for p in m.parameters()) / 2**20:.0f}M'
+print(size)
+m.to(DEV)
+print(m(torch.ones(1, 1).long().to(m.device)))
+
+def wsd_lr_mult(step):
+  warmup_steps = 25
+  warmdown_steps = 250
+  final_lr_mult = 0.1
+  if step < warmup_steps:
+    return (step+1) / warmup_steps
+  if step < total_steps - warmdown_steps:
+    return 1.0
+  else:
+    progress = (total_steps - step) / warmdown_steps
+    return progress * 1.0 + (1 - progress) * final_lr_mult
 
 # ;;
 
 set_seed(0)
 bs = 1024
-lr = 6e-3
+lr = 1e-2
 eval_every = 10_000
-dev = 0
 
-name = f'pico-1M_bs{bs}_lr{lr}'
+name = f'pico-{size}_bs{bs}_lr{lr}'
 run = wandb.init(project='puzzle', name=name)
-opt = torch.optim.AdamW(m.parameters(), lr=lr)
+# opt = torch.optim.AdamW(m.parameters(), lr=lr, eps=1e-10, weight_decay=0.01, betas=(0.8, 0.99))
+opt = torch.optim.Muon(m.parameters(), lr=lr, eps=1e-10, weight_decay=0.00, ns_steps=5, momentum=0.95)
 m.train()
-m.to(torch.bfloat16)
-m.to(dev)
 m = torch.compile(m)
 total_steps = math.ceil(len(train_tokens)/bs)
 tbar = tqdm(batched(train_tokens, bs), total=total_steps)
-scheduler = get_scheduler('cosine_with_min_lr', optimizer=opt, num_warmup_steps=int(total_steps * 0.1), num_training_steps=total_steps, scheduler_specific_kwargs={"min_lr_rate": 0.1})
 
 for ix, batch in enumerate(tbar):
   stime = time()
-  tokens = torch.stack(batch).to(dev, non_blocking=True)
+  tokens = torch.stack(batch).to(DEV, non_blocking=True)
   labels = tokens[:, 1:].contiguous()
   inputs = tokens[:, :-1].contiguous()
 
   loss = m(inputs, labels=labels)
+
   loss.backward()
   torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+  for group in opt.param_groups:
+    group["lr"] = lr * wsd_lr_mult(ix)
+
   opt.step()
   opt.zero_grad()
-  scheduler.step()
   torch.cuda.synchronize()
   etime = time()
 
-  stat = {"loss": loss.item(), "lr": float(scheduler.get_last_lr()[0]), "tps": inputs.numel() / (etime-stime)}
+  stat = {"loss": loss.item(), "lr": lr * wsd_lr_mult(ix), "tps": inputs.numel() / (etime-stime)}
   if ix % 10 == 0:
     tbar.set_postfix(stat)
     run.log(stat, step=ix)
@@ -234,7 +275,7 @@ for ix, batch in enumerate(tbar):
       eval_losses = []
       eval_tbar = tqdm(batched(valid_tokens, bs), total=math.ceil(len(valid_tokens)/bs))
       for eval_batch in eval_tbar:
-        eval_tokens = torch.stack(eval_batch).to(dev, non_blocking=True)
+        eval_tokens = torch.stack(eval_batch).to(DEV, non_blocking=True)
         eval_labels = eval_tokens[:, 1:].contiguous()
         eval_inputs = eval_tokens[:, :-1].contiguous()
         eval_loss = m(eval_inputs, labels=eval_labels)
