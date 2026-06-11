@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset
-from kernels import get_kernel
 from matplotlib import pyplot
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -55,8 +54,6 @@ def decode(tokens):
     board = board.mirror()
   return board
 
-# ;;
-
 def getboard(x):
   b = chess.Board(x["FEN"])
   if "Moves" in x:
@@ -65,38 +62,37 @@ def getboard(x):
   return b
 
 xs = load_dataset("Lichess/chess-puzzles", split='train')
-xs = xs.shuffle(0)
+xs = xs.map(lambda x: {"tokens": encode(getboard(x))}, num_proc=10, remove_columns=xs.column_names)
+xs = xs.train_test_split(test_size=0.02, seed=0)
+xs = xs.with_format("numpy")
 
-valid = xs.select(range(int(len(xs) * 0.02)))
-train = xs.select(range(int(len(xs) * 0.02), len(xs)))
+def savebin(xs, path):
+  mmap = np.memmap(path, dtype=np.uint8, mode="w+", shape=(len(xs), 66))
+  bs = 100_000
+  for i in range(0, len(xs), bs):
+    mmap[i:i+bs] = np.stack(xs[i:i+bs]['tokens'])
+  mmap.flush()
 
-train = train.map(lambda x: {"tokens": encode(getboard(x))}, num_proc=10)
-valid = valid.map(lambda x: {"tokens": encode(getboard(x))}, num_proc=10)
+savebin(xs['train'], 'train.bin')
+savebin(xs['test'], 'valid.bin')
 
-train_tokens = torch.tensor(train['tokens'], dtype=torch.long)
-valid_tokens = torch.tensor(valid['tokens'], dtype=torch.long)
+print(f'{len(xs["train"]) / 1e6:.1f}M train size, {len(xs["test"]) / 1e6:.1f}M valid size')
 
-print(f'{len(train_tokens) / 1e6:.1f}M train size, {len(valid_tokens) / 1e6:.1f}M valid size')
+train = np.memmap('train.bin', dtype=np.uint8, mode='r').reshape(-1, 66)
+valid = np.memmap('valid.bin', dtype=np.uint8, mode='r').reshape(-1, 66)
 
-train_tokens.numel() * train_tokens.element_size() >> 20
+def overbatch(xs, bs):
+  buffers = [torch.empty((bs, xs.shape[1]), dtype=torch.long, pin_memory=True) for _ in range(2)]
+  bix = 0
+  for ix in range(0, len(xs)-bs+1, bs):
+    b = buffers[bix]; bix ^= 1
+    np.copyto(b.numpy(), xs[ix:ix+bs])
+    yield b.to(DEV, non_blocking=True)
+
 # ;;
 
-kernel_module = get_kernel("kernels-community/flash-attn2", version=1)
-# kernel_module = get_kernel("kernels-community/flash-attn4", version=0)
-flash_attn_func = kernel_module.flash_attn_func
 DTYPE = torch.bfloat16
 DEV = torch.device(0)
-
-from torch.nn.attention.flex_attention import flex_attention
-from torch.nn.attention.flex_attention import create_block_mask
-
-def causal(b, h, q_idx, kv_idx):
-    return q_idx >= kv_idx
-
-block_mask = create_block_mask(causal, B=None, H=4, Q_LEN=4, KV_LEN=4)
-create_block_mask = torch.compile(create_block_mask)
-# block_mask = torch.compile(block_mask)
-flex_attention = torch.compile(flex_attention, dynamic=False)
 
 @dataclass
 class Config:
@@ -110,8 +106,8 @@ def norm(x):
   return F.rms_norm(x, (x.size(-1),))
 
 class Linear(nn.Linear):
-    def forward(self, x):
-        return F.linear(x, self.weight.to(dtype=x.dtype))
+  def forward(self, x):
+    return F.linear(x, self.weight.to(dtype=x.dtype))
 
 class MLP(nn.Module):
   def __init__(self, cfg):
@@ -120,28 +116,19 @@ class MLP(nn.Module):
     self.linear2 = Linear(4 * cfg.dim, cfg.dim, bias=False)
 
   def forward(self, x):
-    x = self.linear1(x)
-    x = F.relu(x).square()
-    x = self.linear2(x)
-    return x
+    return self.linear2(F.relu(self.linear1(x)).square())
 
 class MHA(nn.Module):
   def __init__(self, cfg):
     super().__init__()
     self.cfg = cfg
-    self.q = Linear(cfg.dim, cfg.dim, bias=False)
-    self.k = Linear(cfg.dim, cfg.dim, bias=False)
-    self.v = Linear(cfg.dim, cfg.dim, bias=False)
+    self.qkv = Linear(cfg.dim, 3 * cfg.dim, bias=False)
     self.o = Linear(cfg.dim, cfg.dim, bias=False)
 
   def forward(self, x):
     B, T, D = x.shape
-    q = self.q(x).view(B, T, self.cfg.heads, D // self.cfg.heads)
-    k = self.k(x).view(B, T, self.cfg.heads, D // self.cfg.heads)
-    v = self.v(x).view(B, T, self.cfg.heads, D // self.cfg.heads)
-    y = flash_attn_func(q, k, v, causal=True)
-    # y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask).transpose(1, 2)
-    # y = flex_attention(q, k, v, block_mask=block_mask)
+    q, k, v = (t.view(B, T, self.cfg.heads, D//self.cfg.heads) for t in self.qkv(x).chunk(3, dim=-1))
+    y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True).transpose(1, 2)
     y = y.contiguous().view(B, T, D)
     y = self.o(y)
     return y
@@ -190,9 +177,7 @@ class Picoformer(nn.Module):
     torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
     s = np.sqrt(3)/np.sqrt(self.cfg.dim)
     for layer in self.layers:
-      torch.nn.init.uniform_(layer.mha.q.weight, -s, s)
-      torch.nn.init.uniform_(layer.mha.k.weight, -s, s)
-      torch.nn.init.uniform_(layer.mha.v.weight, -s, s)
+      torch.nn.init.uniform_(layer.mha.qkv.weight, -s, s)
       torch.nn.init.zeros_(layer.mha.o.weight)
       torch.nn.init.uniform_(layer.mlp.linear1.weight, -0.4 * s, 0.4 * s)
       torch.nn.init.zeros_(layer.mlp.linear2.weight)
@@ -210,13 +195,15 @@ class Picoformer(nn.Module):
     return x
 
 cfg = Config()
-cfg = Config(dim=256, layers=16)
+# cfg = Config(dim=256, layers=16)
 m = Picoformer(cfg)
-# m.init_weights()
+m.init_weights()
 size = f'{sum(p.numel() for p in m.parameters()) / 2**20:.0f}M'
 print(size)
 m.to(DEV)
 print(m(torch.ones(1, 1).long().to(m.device)))
+
+# ;;
 
 def wsd_lr_mult(step):
   warmup_steps = 25
@@ -230,8 +217,6 @@ def wsd_lr_mult(step):
     progress = (total_steps - step) / warmdown_steps
     return progress * 1.0 + (1 - progress) * final_lr_mult
 
-# ;;
-
 set_seed(0)
 bs = 1024
 lr = 1e-2
@@ -239,18 +224,16 @@ eval_every = 10_000
 
 name = f'pico-{size}_bs{bs}_lr{lr}'
 run = wandb.init(project='puzzle', name=name)
-# opt = torch.optim.AdamW(m.parameters(), lr=lr, eps=1e-10, weight_decay=0.01, betas=(0.8, 0.99))
-opt = torch.optim.Muon(m.parameters(), lr=lr, eps=1e-10, weight_decay=0.00, ns_steps=5, momentum=0.95)
+opt = torch.optim.Muon(m.parameters(), lr=lr, eps=1e-10, weight_decay=0, ns_steps=5, momentum=0.95)
 m.train()
 m = torch.compile(m)
-total_steps = math.ceil(len(train_tokens)/bs)
-tbar = tqdm(batched(train_tokens, bs), total=total_steps)
+total_steps = math.floor(len(train)/bs)
+tbar = tqdm(overbatch(train, bs), total=total_steps)
 
 for ix, batch in enumerate(tbar):
   stime = time()
-  tokens = torch.stack(batch).to(DEV, non_blocking=True)
-  labels = tokens[:, 1:].contiguous()
-  inputs = tokens[:, :-1].contiguous()
+  labels = batch[:, 1:].contiguous()
+  inputs = batch[:, :-1].contiguous()
 
   loss = m(inputs, labels=labels)
 
@@ -273,14 +256,13 @@ for ix, batch in enumerate(tbar):
     m.eval()
     with torch.no_grad():
       eval_losses = []
-      eval_tbar = tqdm(batched(valid_tokens, bs), total=math.ceil(len(valid_tokens)/bs))
+      eval_tbar = tqdm(overbatch(valid, bs), total=math.floor(len(valid)/bs))
       for eval_batch in eval_tbar:
-        eval_tokens = torch.stack(eval_batch).to(DEV, non_blocking=True)
-        eval_labels = eval_tokens[:, 1:].contiguous()
-        eval_inputs = eval_tokens[:, :-1].contiguous()
+        eval_labels = eval_batch[:, 1:].contiguous()
+        eval_inputs = eval_batch[:, :-1].contiguous()
         eval_loss = m(eval_inputs, labels=eval_labels)
-        eval_losses.append(eval_loss * len(eval_tokens))
-      eval_loss = sum(eval_losses) / len(valid_tokens)
+        eval_losses.append(eval_loss * len(eval_batch))
+      eval_loss = sum(eval_losses) / len(valid)
       run.log({"eval_loss": eval_loss.item()}, step=ix)
     m.train()
 run.finish()
