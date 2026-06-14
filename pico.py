@@ -9,15 +9,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from matplotlib import pyplot
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.nn import Embedding, RMSNorm
-from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from torch.utils.data import TensorDataset
-from transformers import get_scheduler, set_seed
+from transformers import set_seed
+from itertools import chain
 torch.set_printoptions(sci_mode=False)
 
 PIECE_MAP = {
@@ -61,9 +60,25 @@ def getboard(x):
     b.push(chess.Move.from_uci(head))
   return b
 
+# ;;
+
+def getboards(x):
+  b = chess.Board(x["FEN"])
+  unique = []
+  for opmove, ourmove in batched(x['Moves'].split(" "), 2):
+    b.push(chess.Move.from_uci(opmove))
+    unique.append(b.fen())
+    b.push(chess.Move.from_uci(ourmove))
+  return unique
+
 xs = load_dataset("Lichess/chess-puzzles", split='train')
-xs = xs.map(lambda x: {"tokens": encode(getboard(x))}, num_proc=10, remove_columns=xs.column_names)
-xs = xs.train_test_split(test_size=0.02, seed=0)
+xs = xs.map(lambda x: {"fen": getboards(x)}, remove_columns=xs.column_names, num_proc=10)
+xs = xs.map(lambda x: {"fen": list(chain.from_iterable(x['fen']))}, batched=True)
+xs = xs.map(lambda x: {"tokens": encode(chess.Board(x['fen']))}, num_proc=10, remove_columns=xs.column_names)
+
+# ;;
+
+xs = xs.train_test_split(test_size=0.01, seed=0)
 xs = xs.with_format("numpy")
 
 def savebin(xs, path):
@@ -194,14 +209,39 @@ class Picoformer(nn.Module):
       x = torch.hstack([x, tokens])
     return x
 
+  def init_opt(self):
+    muon = sum([list(l.parameters()) for l in self.layers], [])
+    adam = list(self.lm_head.parameters()) + list(self.pos_embd.parameters()) + list(self.embd.parameters())
+
+    return MuonAdam(muon, adam)
+
 cfg = Config()
-# cfg = Config(dim=256, layers=16)
+cfg = Config(dim=256, layers=16)
 m = Picoformer(cfg)
 m.init_weights()
 size = f'{sum(p.numel() for p in m.parameters()) / 2**20:.0f}M'
 print(size)
 m.to(DEV)
 print(m(torch.ones(1, 1).long().to(m.device)))
+
+class MuonAdam:
+  def __init__(self, muon_params, adam_params):
+    self.muon = torch.optim.Muon(muon_params, lr=1e-2, eps=1e-10, weight_decay=0, ns_steps=5, momentum=0.95)
+    self.adam = torch.optim.AdamW(adam_params, lr=1e-2, eps=1e-10, weight_decay=0, betas=(0.95, 0.99))
+    for group in self.muon.param_groups + self.adam.param_groups:
+      group["base_lr"] = group["lr"]
+
+  def set_lr_mult(self, mult):
+    for group in self.muon.param_groups + self.adam.param_groups:
+      group["lr"] = group["base_lr"] * mult
+
+  def step(self):
+    self.muon.step()
+    self.adam.step()
+
+  def zero_grad(self):
+    self.muon.zero_grad()
+    self.adam.zero_grad()
 
 # ;;
 
@@ -224,7 +264,7 @@ eval_every = 10_000
 
 name = f'pico-{size}_bs{bs}_lr{lr}'
 run = wandb.init(project='puzzle', name=name)
-opt = torch.optim.Muon(m.parameters(), lr=lr, eps=1e-10, weight_decay=0, ns_steps=5, momentum=0.95)
+opt = m.init_opt()
 m.train()
 m = torch.compile(m)
 total_steps = math.floor(len(train)/bs)
@@ -239,13 +279,13 @@ for ix, batch in enumerate(tbar):
 
   loss.backward()
   torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
-  for group in opt.param_groups:
-    group["lr"] = lr * wsd_lr_mult(ix)
+  opt.set_lr_mult(wsd_lr_mult(ix))
 
   opt.step()
   opt.zero_grad()
-  torch.cuda.synchronize()
-  etime = time()
+  if ix % 10 == 0:
+    torch.cuda.synchronize()
+    etime = time()
 
   stat = {"loss": loss.item(), "lr": lr * wsd_lr_mult(ix), "tps": inputs.numel() / (etime-stime)}
   if ix % 10 == 0:
@@ -268,7 +308,7 @@ for ix, batch in enumerate(tbar):
 run.finish()
 
 os.makedirs(f"ckpts/{name}", exist_ok=True)
-save_file(m.state_dict(), f"ckpts/{name}/model.safetensors")
+save_file(m._orig_mod.state_dict(), f"ckpts/{name}/model.safetensors")
 
 out_tokens = m.generate(torch.ones(1024,1,dtype=torch.long).to(m.device) * 13)
 out = [decode(x) for x in out_tokens]
