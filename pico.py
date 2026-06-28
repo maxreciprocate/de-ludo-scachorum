@@ -17,6 +17,7 @@ from torch.nn import Embedding, RMSNorm
 from tqdm import tqdm
 from transformers import set_seed
 from itertools import chain
+from concurrent.futures import ThreadPoolExecutor
 torch.set_printoptions(sci_mode=False)
 
 PIECE_MAP = {
@@ -46,68 +47,14 @@ def decode(tokens):
     if tok != 0:
       color = chess.BLACK if tok > 6 else chess.WHITE
       index = tok - 6 if tok > 6 else tok
-      piece = chess.Piece(index % 7, color)
+      piece = chess.Piece(index, color)
       board.set_piece_at(ix, piece)
   turn = chess.WHITE if tokens[-1] == 14 else chess.BLACK
   if turn == chess.BLACK:
     board = board.mirror()
   return board
 
-def getboard(x):
-  b = chess.Board(x["FEN"])
-  if "Moves" in x:
-    head, *_ = x["Moves"].split()
-    b.push(chess.Move.from_uci(head))
-  return b
-
-# ;;
-
-def getboards(x):
-  b = chess.Board(x["FEN"])
-  unique = []
-  for opmove, ourmove in batched(x['Moves'].split(" "), 2):
-    b.push(chess.Move.from_uci(opmove))
-    unique.append(b.fen())
-    b.push(chess.Move.from_uci(ourmove))
-  return unique
-
-xs = load_dataset("Lichess/chess-puzzles", split='train')
-xs = xs.map(lambda x: {"fen": getboards(x)}, remove_columns=xs.column_names, num_proc=10)
-xs = xs.map(lambda x: {"fen": list(chain.from_iterable(x['fen']))}, batched=True)
-xs = xs.map(lambda x: {"tokens": encode(chess.Board(x['fen']))}, num_proc=10, remove_columns=xs.column_names)
-
-# ;;
-
-xs = xs.train_test_split(test_size=0.01, seed=0)
-xs = xs.with_format("numpy")
-
-def savebin(xs, path):
-  mmap = np.memmap(path, dtype=np.uint8, mode="w+", shape=(len(xs), 66))
-  bs = 100_000
-  for i in range(0, len(xs), bs):
-    mmap[i:i+bs] = np.stack(xs[i:i+bs]['tokens'])
-  mmap.flush()
-
-savebin(xs['train'], 'train.bin')
-savebin(xs['test'], 'valid.bin')
-
-print(f'{len(xs["train"]) / 1e6:.1f}M train size, {len(xs["test"]) / 1e6:.1f}M valid size')
-
-train = np.memmap('train.bin', dtype=np.uint8, mode='r').reshape(-1, 66)
-valid = np.memmap('valid.bin', dtype=np.uint8, mode='r').reshape(-1, 66)
-
-def overbatch(xs, bs):
-  buffers = [torch.empty((bs, xs.shape[1]), dtype=torch.long, pin_memory=True) for _ in range(2)]
-  bix = 0
-  for ix in range(0, len(xs)-bs+1, bs):
-    b = buffers[bix]; bix ^= 1
-    np.copyto(b.numpy(), xs[ix:ix+bs])
-    yield b.to(DEV, non_blocking=True)
-
-# ;;
-
 DTYPE = torch.bfloat16
-DEV = torch.device(0)
 
 @dataclass
 class Config:
@@ -173,6 +120,7 @@ class Picoformer(nn.Module):
     pos = torch.arange(T, device=x.device)
     x = self.embd(x) + self.pos_embd(pos)
     x = x.to(DTYPE)
+    x = norm(x)
     for f in self.layers:
       x = f(x)
     x = self.lm_head(norm(x)).float()
@@ -209,25 +157,18 @@ class Picoformer(nn.Module):
       x = torch.hstack([x, tokens])
     return x
 
-  def init_opt(self):
+  def init_opt(self, muon_lr=1e-2, embd_lr=2e-2, head_lr=3e-3):
     muon = sum([list(l.parameters()) for l in self.layers], [])
-    adam = list(self.lm_head.parameters()) + list(self.pos_embd.parameters()) + list(self.embd.parameters())
-
-    return MuonAdam(muon, adam)
-
-cfg = Config()
-cfg = Config(dim=256, layers=16)
-m = Picoformer(cfg)
-m.init_weights()
-size = f'{sum(p.numel() for p in m.parameters()) / 2**20:.0f}M'
-print(size)
-m.to(DEV)
-print(m(torch.ones(1, 1).long().to(m.device)))
+    adam = [
+      {'params': list(self.lm_head.parameters()), 'lr': head_lr},
+      {'params': list(self.embd.parameters()) + list(self.pos_embd.parameters()), 'lr': embd_lr},
+    ]
+    return MuonAdam(muon, adam, muon_lr=muon_lr)
 
 class MuonAdam:
-  def __init__(self, muon_params, adam_params):
-    self.muon = torch.optim.Muon(muon_params, lr=1e-2, eps=1e-10, weight_decay=0, ns_steps=5, momentum=0.95)
-    self.adam = torch.optim.AdamW(adam_params, lr=1e-2, eps=1e-10, weight_decay=0, betas=(0.95, 0.99))
+  def __init__(self, muon_params, adam_groups, muon_lr=1e-2):
+    self.muon = torch.optim.Muon(muon_params, lr=muon_lr, eps=1e-10, weight_decay=0, ns_steps=5, momentum=0.95)
+    self.adam = torch.optim.AdamW(adam_groups, eps=1e-10, weight_decay=0, betas=(0.95, 0.99))
     for group in self.muon.param_groups + self.adam.param_groups:
       group["base_lr"] = group["lr"]
 
@@ -239,11 +180,9 @@ class MuonAdam:
     self.muon.step()
     self.adam.step()
 
-  def zero_grad(self):
-    self.muon.zero_grad()
-    self.adam.zero_grad()
-
-# ;;
+  def zero_grad(self, set_to_none=True):
+    self.muon.zero_grad(set_to_none=set_to_none)
+    self.adam.zero_grad(set_to_none=set_to_none)
 
 def wsd_lr_mult(step):
   warmup_steps = 25
@@ -257,60 +196,96 @@ def wsd_lr_mult(step):
     progress = (total_steps - step) / warmdown_steps
     return progress * 1.0 + (1 - progress) * final_lr_mult
 
-set_seed(0)
-bs = 1024
-lr = 1e-2
-eval_every = 10_000
+def overbatch(xs, bs, dev):
+  if len(xs) < bs:
+    return
+  buffers = [torch.empty((bs, xs.shape[1]), dtype=torch.long, pin_memory=True) for _ in range(2)]
+  indices = range(0, len(xs) - bs + 1, bs)
+  with ThreadPoolExecutor(max_workers=1) as ex:
+    np.copyto(buffers[0].numpy(), xs[indices[0]:indices[0]+bs])
+    fut = None
+    for i, ix in enumerate(indices):
+      if fut is not None:
+        fut.result()
+      nxt = i + 1
+      if nxt < len(indices):
+        fut = ex.submit(np.copyto, buffers[nxt % 2].numpy(), xs[indices[nxt]:indices[nxt]+bs])
+      else:
+        fut = None
+      yield buffers[i % 2].to(dev, non_blocking=True)
 
-name = f'pico-{size}_bs{bs}_lr{lr}'
-run = wandb.init(project='puzzle', name=name)
-opt = m.init_opt()
-m.train()
-m = torch.compile(m)
-total_steps = math.floor(len(train)/bs)
-tbar = tqdm(overbatch(train, bs), total=total_steps)
+if __name__ == '__main__':
+  set_seed(0)
+  DEV = torch.device('cuda')
+  cfg = Config(dim=256, layers=16)
+  m = Picoformer(cfg)
+  m.init_weights()
+  size = f'{sum(p.numel() for p in m.parameters()) / 2**20:.0f}M'
+  print(size)
+  m.to(DEV)
 
-for ix, batch in enumerate(tbar):
-  stime = time()
-  labels = batch[:, 1:].contiguous()
-  inputs = batch[:, :-1].contiguous()
+  bs = 1024
+  muon_lr = 1e-2
+  embd_lr = 2e-2
+  head_lr = 3e-3
+  eval_every = 10_000
 
-  loss = m(inputs, labels=labels)
+  train = np.memmap('train.bin', dtype=np.uint8, mode='r').reshape(-1, 66)
+  valid = np.memmap('valid.bin', dtype=np.uint8, mode='r').reshape(-1, 66)
 
-  loss.backward()
-  torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
-  opt.set_lr_mult(wsd_lr_mult(ix))
+  name = f'pico-{size}_bs{bs}_lr{muon_lr}'
+  run = wandb.init(project='puzzle', name=name)
+  opt = m.init_opt(muon_lr=muon_lr, embd_lr=embd_lr, head_lr=head_lr)
+  m.train()
+  m = torch.compile(m)
+  total_steps = math.floor(len(train)/bs)
+  tbar = tqdm(overbatch(train, bs, DEV), total=total_steps)
+  torch.cuda.synchronize()
+  window_t = time()
+  window_tokens = 0
 
-  opt.step()
-  opt.zero_grad()
-  if ix % 10 == 0:
-    torch.cuda.synchronize()
-    etime = time()
+  for ix, batch in enumerate(tbar):
+    labels = batch[:, 1:].contiguous()
+    inputs = batch[:, :-1].contiguous()
 
-  stat = {"loss": loss.item(), "lr": lr * wsd_lr_mult(ix), "tps": inputs.numel() / (etime-stime)}
-  if ix % 10 == 0:
-    tbar.set_postfix(stat)
-    run.log(stat, step=ix)
+    loss = m(inputs, labels=labels)
 
-  if ix > 0 and (ix % eval_every == 0 or ix == total_steps - 1):
-    m.eval()
-    with torch.no_grad():
-      eval_losses = []
-      eval_tbar = tqdm(overbatch(valid, bs), total=math.floor(len(valid)/bs))
-      for eval_batch in eval_tbar:
-        eval_labels = eval_batch[:, 1:].contiguous()
-        eval_inputs = eval_batch[:, :-1].contiguous()
-        eval_loss = m(eval_inputs, labels=eval_labels)
-        eval_losses.append(eval_loss * len(eval_batch))
-      eval_loss = sum(eval_losses) / len(valid)
-      run.log({"eval_loss": eval_loss.item()}, step=ix)
-    m.train()
-run.finish()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+    opt.set_lr_mult(wsd_lr_mult(ix))
 
-os.makedirs(f"ckpts/{name}", exist_ok=True)
-save_file(m._orig_mod.state_dict(), f"ckpts/{name}/model.safetensors")
+    opt.step()
+    opt.zero_grad()
 
-out_tokens = m.generate(torch.ones(1024,1,dtype=torch.long).to(m.device) * 13)
-out = [decode(x) for x in out_tokens]
-is_valid = sum([b.is_valid() for b in out]) / len(out)
-print(f'is valid: {is_valid*100:.1f}%')
+    window_tokens += inputs.numel()
+    if ix % 10 == 0:
+      torch.cuda.synchronize()
+      t1 = time()
+      stat = {"loss": loss.item(), "lr": muon_lr * wsd_lr_mult(ix), "tps": window_tokens / (t1 - window_t)}
+      window_t = t1
+      window_tokens = 0
+      tbar.set_postfix(stat)
+      run.log(stat, step=ix)
+
+    if ix > 0 and (ix % eval_every == 0 or ix == total_steps - 1):
+      m.eval()
+      with torch.no_grad():
+        eval_losses = []
+        eval_tbar = tqdm(overbatch(valid, bs, DEV), total=math.floor(len(valid)/bs))
+        for eval_batch in eval_tbar:
+          eval_labels = eval_batch[:, 1:].contiguous()
+          eval_inputs = eval_batch[:, :-1].contiguous()
+          eval_loss = m(eval_inputs, labels=eval_labels)
+          eval_losses.append(eval_loss * len(eval_batch))
+        eval_loss = sum(eval_losses) / len(valid)
+        run.log({"eval_loss": eval_loss.item()}, step=ix)
+      m.train()
+  run.finish()
+
+  os.makedirs(f"ckpts/{name}", exist_ok=True)
+  save_file(m._orig_mod.state_dict(), f"ckpts/{name}/model.safetensors")
+
+  out_tokens = m.generate(torch.ones(1024,1,dtype=torch.long).to(m.device) * 13)
+  out = [decode(x) for x in out_tokens]
+  is_valid = sum([b.is_valid() for b in out]) / len(out)
+  print(f'is valid: {is_valid*100:.1f}%')
