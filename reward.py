@@ -14,6 +14,9 @@ from chess.engine import Mate, Score
 from datasets import Dataset, concatenate_datasets, load_dataset
 from rapidfuzz.distance import Levenshtein
 from rich import print as pprint
+from rich.table import Table
+from rich.console import Console
+from rich import box as rich_box
 from dataclasses import asdict, dataclass
 from matplotlib import pyplot as plt
 
@@ -44,7 +47,7 @@ else:
   cpu_count = int(cpu_count)
 
 stockfishcfg = {"Threads": 1, "Hash": 1024}
-stockfish_meganodes = int(os.environ.get("STOCKFISH_MEGANODES", 40))
+stockfish_meganodes = int(os.environ.get("MEGANODES", 1))
 stockfish_maxdepth = 40
 stockfish_limit = chess.engine.Limit(nodes=stockfish_meganodes * 1_000_000, time=40, depth=stockfish_maxdepth)
 
@@ -255,11 +258,12 @@ def reward(fen, **kwargs):
   batch_fen_distance = min_fen_distance(expanded_fen, prior_fens)
   pv_str = " ".join(puzzle.positions[0].eval['top']['pv']) if puzzle.positions[0].eval['top'] else ""
   batch_pv_distance = min_pv_distance(pv_str, prior_pvs)
+
   if score == 1:
-    if batch_fen_distance is not None and batch_fen_distance < fen_distance_threshold:
+    if kwargs.get('if_similar_discard', True) and batch_fen_distance is not None and batch_fen_distance < fen_distance_threshold:
       print(f"too similar fen: {fen}")
       score = 0.0
-    elif batch_pv_distance is not None and batch_pv_distance < pv_distance_threshold:
+    elif kwargs.get('if_similar_discard', True) and batch_pv_distance is not None and batch_pv_distance < pv_distance_threshold:
       print(f"too similar pv: {pv_str}")
       score = 0.0
     else:
@@ -435,19 +439,31 @@ def test_distance():
   print("min_pv_distance ~ all good")
 
 def test_goldenset():
-  valid = Dataset.from_json(os.path.expanduser("../../data/opus/goldenset-valid.jsonl"))
-  train = Dataset.from_json(os.path.expanduser("../../data/opus/goldenset-train.jsonl"))
+  valid = Dataset.from_json(os.path.expanduser("/root/data/opus/goldenset-valid.jsonl"))
+  train = Dataset.from_json(os.path.expanduser("/root/data/opus/goldenset-train.jsonl"))
   valid = valid.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=cpu_count)
   train = train.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=cpu_count)
-
   allset = concatenate_datasets([train, valid])
+
+  ap_uniq_valid = average_precision([m['uniqueness'] for m in valid], valid['label'])
+  ap_uniq_train = average_precision([m['uniqueness'] for m in train], train['label'])
+  ap_uniq_allset = average_precision([m['uniqueness'] for m in allset], allset['label'])
+  ap_heurstic_valid = average_precision([m['penalty'] for m in valid['metrics']], valid['label'])
+  ap_heurstic_train = average_precision([m['penalty'] for m in train['metrics']], train['label'])
+  ap_heurstic_allset = average_precision([m['penalty'] for m in allset['metrics']], allset['label'])
   apvalid = average_precision([m['counterint'] for m in valid['metrics']], valid['label'])
   aptrain = average_precision([m['counterint'] for m in train['metrics']], train['label'])
   apallset = average_precision([m['counterint'] for m in allset['metrics']], allset['label'])
 
-  print(f'train={aptrain:.4f}')
-  print(f'train+test={apallset:.4f}')
-  print(f'test={apvalid:.4f}')
+  table = Table(title=f"@ {stockfish_meganodes}MN", box=rich_box.ASCII)
+  table.add_column("Metric")
+  table.add_column("Train")
+  table.add_column("Test")
+  table.add_column("Train+Test")
+  table.add_row("counterint", f"{aptrain:.4f}", f"{apvalid:.4f}", f"{apallset:.4f}")
+  table.add_row("heuristic", f"{ap_heurstic_train:.4f}", f"{ap_heurstic_valid:.4f}", f"{ap_heurstic_allset:.4f}")
+  table.add_row("uniqueness", f"{ap_uniq_train:.4f}", f"{ap_uniq_valid:.4f}", f"{ap_uniq_allset:.4f}")
+  Console().print(table)
 
   fig, ax = plt.subplots(figsize=(12, 6))
   for label, color in [(0, 'blue'), (1, 'red')]:
@@ -465,9 +481,10 @@ def test_goldenset():
   ax.legend()
   plt.tight_layout()
   plt.show()
+# ;;
 
 if __name__ == '__main__':
-  # test_goldenset()
+  test_goldenset()
   # test_distance()
-  x = fen_to_puzzle("8/8/6k1/4q1P1/8/5K2/8/8 b - - 3 3")
-  x.positions[0]
+  # x = fen_to_puzzle("8/8/6k1/4q1P1/8/5K2/8/8 b - - 3 3")
+  # x.positions[0]
