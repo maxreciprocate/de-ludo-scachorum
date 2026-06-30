@@ -1,5 +1,7 @@
+import argparse
 import math
 import os
+import sys
 from dataclasses import dataclass
 from itertools import batched
 from time import sleep, time
@@ -8,9 +10,10 @@ import chess
 import numpy as np
 import torch
 import torch.nn as nn
+from datasets import load_dataset
 import torch.nn.functional as F
-from datasets import load_dataset, Dataset
 from matplotlib import pyplot
+from torch.utils.data import Dataset,DataLoader
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.nn import Embedding, RMSNorm
@@ -61,7 +64,7 @@ class Config:
   vocab: int = 16
   dim: int = 128
   layers: int = 6
-  heads: int = 4
+  heads: int = 2
   length: int = 66
 
 def norm(x):
@@ -89,8 +92,9 @@ class MHA(nn.Module):
 
   def forward(self, x):
     B, T, D = x.shape
-    q, k, v = (t.view(B, T, self.cfg.heads, D//self.cfg.heads) for t in self.qkv(x).chunk(3, dim=-1))
-    y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True).transpose(1, 2)
+    q, k, v = (t.view(B, T, self.cfg.heads, D//self.cfg.heads).transpose(1, 2) for t in self.qkv(x).chunk(3, dim=-1))
+    q, k = norm(q), norm(k)
+    y = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2)
     y = y.contiguous().view(B, T, D)
     y = self.o(y)
     return y
@@ -127,7 +131,7 @@ class Picoformer(nn.Module):
     softcap = 15
     x = softcap * torch.tanh(x / softcap)
     if labels is not None:
-      return F.cross_entropy(x.view(-1, x.size(-1)), labels.view(-1), ignore_index=-1)
+      return F.cross_entropy(x.view(-1, x.size(-1)), labels.view(-1))
     return x
 
   @property
@@ -157,18 +161,18 @@ class Picoformer(nn.Module):
       x = torch.hstack([x, tokens])
     return x
 
-  def init_opt(self, muon_lr=1e-2, embd_lr=2e-2, head_lr=3e-3):
+  def init_opt(self, muon_lr=1e-2, embd_lr=2e-2, head_lr=3e-3, weight_decay=0.0, adam_beta1=0.95, adam_beta2=0.99, muon_momentum=0.95, ns_steps=5):
     muon = sum([list(l.parameters()) for l in self.layers], [])
     adam = [
       {'params': list(self.lm_head.parameters()), 'lr': head_lr},
       {'params': list(self.embd.parameters()) + list(self.pos_embd.parameters()), 'lr': embd_lr},
     ]
-    return MuonAdam(muon, adam, muon_lr=muon_lr)
+    return MuonAdam(muon, adam, muon_lr=muon_lr, weight_decay=weight_decay, adam_beta1=adam_beta1, adam_beta2=adam_beta2, muon_momentum=muon_momentum, ns_steps=ns_steps)
 
 class MuonAdam:
-  def __init__(self, muon_params, adam_groups, muon_lr=1e-2):
-    self.muon = torch.optim.Muon(muon_params, lr=muon_lr, eps=1e-10, weight_decay=0, ns_steps=5, momentum=0.95)
-    self.adam = torch.optim.AdamW(adam_groups, eps=1e-10, weight_decay=0, betas=(0.95, 0.99))
+  def __init__(self, muon_params, adam_groups, muon_lr=1e-2, weight_decay=0.0, adam_beta1=0.95, adam_beta2=0.99, muon_momentum=0.95, ns_steps=5):
+    self.muon = torch.optim.Muon(muon_params, lr=muon_lr, eps=1e-10, weight_decay=weight_decay, ns_steps=ns_steps, momentum=muon_momentum)
+    self.adam = torch.optim.AdamW(adam_groups, eps=1e-10, weight_decay=weight_decay, betas=(adam_beta1, adam_beta2), fused=True)
     for group in self.muon.param_groups + self.adam.param_groups:
       group["base_lr"] = group["lr"]
 
@@ -184,10 +188,7 @@ class MuonAdam:
     self.muon.zero_grad(set_to_none=set_to_none)
     self.adam.zero_grad(set_to_none=set_to_none)
 
-def wsd_lr_mult(step):
-  warmup_steps = 25
-  warmdown_steps = 250
-  final_lr_mult = 0.1
+def wsd_lr_mult(step, warmup_steps=25, warmdown_steps=250, final_lr_mult=0.1):
   if step < warmup_steps:
     return (step+1) / warmup_steps
   if step < total_steps - warmdown_steps:
@@ -196,50 +197,61 @@ def wsd_lr_mult(step):
     progress = (total_steps - step) / warmdown_steps
     return progress * 1.0 + (1 - progress) * final_lr_mult
 
-def overbatch(xs, bs, dev):
-  if len(xs) < bs:
-    return
-  buffers = [torch.empty((bs, xs.shape[1]), dtype=torch.long, pin_memory=True) for _ in range(2)]
-  indices = range(0, len(xs) - bs + 1, bs)
-  with ThreadPoolExecutor(max_workers=1) as ex:
-    np.copyto(buffers[0].numpy(), xs[indices[0]:indices[0]+bs])
-    fut = None
-    for i, ix in enumerate(indices):
-      if fut is not None:
-        fut.result()
-      nxt = i + 1
-      if nxt < len(indices):
-        fut = ex.submit(np.copyto, buffers[nxt % 2].numpy(), xs[indices[nxt]:indices[nxt]+bs])
-      else:
-        fut = None
-      yield buffers[i % 2].to(dev, non_blocking=True)
+class FenDataset(torch.utils.data.Dataset):
+  def __init__(self, fens):
+    self.fens = fens
+  def __len__(self):
+    return len(self.fens)
+  def __getitem__(self, ix):
+    return encode(chess.Board(self.fens[ix]['fen']))
 
 if __name__ == '__main__':
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--model", default="12M", choices=["12M", "192M"])
+  parser.add_argument("--muon_lr", type=float, default=1e-2)
+  parser.add_argument("--embd_lr", type=float, default=2e-2)
+  parser.add_argument("--head_lr", type=float, default=3e-3)
+  parser.add_argument("--adam_beta1", type=float, default=0.95)
+  parser.add_argument("--adam_beta2", type=float, default=0.99)
+  parser.add_argument("--weight_decay", type=float, default=0.0)
+  parser.add_argument("--warmup_steps", type=int, default=100)
+  parser.add_argument("--final_lr_mult", type=float, default=0.1)
+  parser.add_argument("--muon_momentum", type=float, default=0.95)
+  parser.add_argument("--ns_steps", type=int, default=5)
+  parser.add_argument("--grad_clip", type=float, default=1.0)
+  parser.add_argument("--eval_every", type=int, default=1_000)
+  parser.add_argument("--run_name", type=str, default=None)
+  args = parser.parse_args(args=[] if "__file__" not in globals() else sys.argv[1:])
+
+  configs = {
+    "12M":  (Config(dim=256,layers=16,heads=4), 3072),
+    "192M": (Config(dim=1024,layers=16,heads=8), 768),
+  }
+  cfg, bs = configs[args.model]
   set_seed(0)
-  DEV = torch.device('cuda')
-  cfg = Config(dim=256, layers=16)
+  dev = torch.device('cuda')
+
   m = Picoformer(cfg)
   m.init_weights()
   size = f'{sum(p.numel() for p in m.parameters()) / 2**20:.0f}M'
   print(size)
-  m.to(DEV)
+  m.to(dev)
 
-  bs = 1024
-  muon_lr = 1e-2
-  embd_lr = 2e-2
-  head_lr = 3e-3
-  eval_every = 10_000
+  from datasets import load_from_disk, load_dataset
+  train = load_from_disk('train_fens')
 
-  train = np.memmap('train.bin', dtype=np.uint8, mode='r').reshape(-1, 66)
-  valid = np.memmap('valid.bin', dtype=np.uint8, mode='r').reshape(-1, 66)
+  valid = load_from_disk('valid_fens')
 
-  name = f'pico-{size}_bs{bs}_lr{muon_lr}'
-  run = wandb.init(project='puzzle', name=name)
-  opt = m.init_opt(muon_lr=muon_lr, embd_lr=embd_lr, head_lr=head_lr)
+  name = args.run_name or f'pico-{size}_bs{bs}_lr{args.muon_lr}'
+  run = wandb.init(project='puzzle', name=name, config=vars(args))
+  opt = m.init_opt(muon_lr=args.muon_lr, embd_lr=args.embd_lr, head_lr=args.head_lr, weight_decay=args.weight_decay, adam_beta1=args.adam_beta1, adam_beta2=args.adam_beta2, muon_momentum=args.muon_momentum, ns_steps=args.ns_steps)
   m.train()
-  m = torch.compile(m)
+  m = torch.compile(m, mode="reduce-overhead")
   total_steps = math.floor(len(train)/bs)
-  tbar = tqdm(overbatch(train, bs, DEV), total=total_steps)
+  warmdown_steps = round(total_steps * 0.1)
+  loader = DataLoader(FenDataset(train), batch_size=bs, num_workers=4,persistent_workers=True,pin_memory=True, drop_last=True)
+  eval_loader = DataLoader(FenDataset(valid), batch_size=bs, num_workers=4,persistent_workers=True,pin_memory=True, drop_last=True)
+  tbar = tqdm(map(lambda b: b.to(dev, non_blocking=True).long(), loader), total=total_steps)
   torch.cuda.synchronize()
   window_t = time()
   window_tokens = 0
@@ -251,8 +263,8 @@ if __name__ == '__main__':
     loss = m(inputs, labels=labels)
 
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
-    opt.set_lr_mult(wsd_lr_mult(ix))
+    torch.nn.utils.clip_grad_norm_(m.parameters(), args.grad_clip)
+    opt.set_lr_mult(wsd_lr_mult(ix, args.warmup_steps, warmdown_steps, args.final_lr_mult))
 
     opt.step()
     opt.zero_grad()
@@ -261,17 +273,17 @@ if __name__ == '__main__':
     if ix % 10 == 0:
       torch.cuda.synchronize()
       t1 = time()
-      stat = {"loss": loss.item(), "lr": muon_lr * wsd_lr_mult(ix), "tps": window_tokens / (t1 - window_t)}
+      stat = {"loss": loss.item(), "lr": args.muon_lr * wsd_lr_mult(ix, args.warmup_steps, warmdown_steps, args.final_lr_mult), "tps": window_tokens / (t1 - window_t)}
       window_t = t1
       window_tokens = 0
       tbar.set_postfix(stat)
       run.log(stat, step=ix)
 
-    if ix > 0 and (ix % eval_every == 0 or ix == total_steps - 1):
+    if ix > 0 and (ix % args.eval_every == 0 or ix == total_steps - 1):
       m.eval()
       with torch.no_grad():
         eval_losses = []
-        eval_tbar = tqdm(overbatch(valid, bs, DEV), total=math.floor(len(valid)/bs))
+        eval_tbar = tqdm(map(lambda b: b.to(dev, non_blocking=True).long(), eval_loader), total=math.floor(len(valid)/bs))
         for eval_batch in eval_tbar:
           eval_labels = eval_batch[:, 1:].contiguous()
           eval_inputs = eval_batch[:, :-1].contiguous()
