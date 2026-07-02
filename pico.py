@@ -1,5 +1,6 @@
 import argparse
 import math
+from huggingface_hub import hf_hub_download
 import os
 import sys
 from dataclasses import dataclass
@@ -10,7 +11,8 @@ import chess
 import numpy as np
 import torch
 import torch.nn as nn
-from datasets import load_dataset
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn.functional as F
 from matplotlib import pyplot
 from torch.utils.data import Dataset,DataLoader
@@ -188,7 +190,7 @@ class MuonAdam:
     self.muon.zero_grad(set_to_none=set_to_none)
     self.adam.zero_grad(set_to_none=set_to_none)
 
-def wsd_lr_mult(step, warmup_steps=25, warmdown_steps=250, final_lr_mult=0.1):
+def wsd_lr_mult(step, total_steps, warmup_steps=25, warmdown_steps=250, final_lr_mult=0.1):
   if step < warmup_steps:
     return (step+1) / warmup_steps
   if step < total_steps - warmdown_steps:
@@ -205,9 +207,20 @@ class FenDataset(torch.utils.data.Dataset):
   def __getitem__(self, ix):
     return encode(chess.Board(self.fens[ix]['fen']))
 
+class BinDataset(torch.utils.data.Dataset):
+  def __init__(self, path, rank=0, world=1):
+    tokens = np.memmap(path, dtype=np.uint8, mode='r').reshape(-1, 66)
+    shard = len(tokens) // world
+    self.tokens = tokens[rank * shard:(rank + 1) * shard]
+  def __len__(self):
+    return len(self.tokens)
+  def __getitem__(self, ix):
+    return torch.from_numpy(self.tokens[ix].copy())
+
 if __name__ == '__main__':
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", default="12M", choices=["12M", "192M"])
+  parser.add_argument("--pretrained", type=str, default=None)
   parser.add_argument("--muon_lr", type=float, default=1e-2)
   parser.add_argument("--embd_lr", type=float, default=2e-2)
   parser.add_argument("--head_lr", type=float, default=3e-3)
@@ -219,39 +232,59 @@ if __name__ == '__main__':
   parser.add_argument("--muon_momentum", type=float, default=0.95)
   parser.add_argument("--ns_steps", type=int, default=5)
   parser.add_argument("--grad_clip", type=float, default=1.0)
-  parser.add_argument("--eval_every", type=int, default=1_000)
+  parser.add_argument("--eval_every", type=int, default=10_000)
+  parser.add_argument("--train_bin", type=str, default="train_positions.bin")
+  parser.add_argument("--valid_bin", type=str, default="valid_puzzle.bin")
   parser.add_argument("--run_name", type=str, default=None)
   args = parser.parse_args(args=[] if "__file__" not in globals() else sys.argv[1:])
 
   configs = {
     "12M":  (Config(dim=256,layers=16,heads=4), 3072),
-    "192M": (Config(dim=1024,layers=16,heads=8), 768),
+    "192M": (Config(dim=1024,layers=16,heads=8), 640),
   }
   cfg, bs = configs[args.model]
-  set_seed(0)
-  dev = torch.device('cuda')
+  ddp = 'RANK' in os.environ
+  if ddp:
+    dist.init_process_group(backend='nccl')
+  rank, world = int(os.environ.get('RANK', '0')), int(os.environ.get('WORLD_SIZE', '1'))
+  rank0 = rank == 0
+  set_seed(rank)
+  torch.cuda.set_device(rank)
+  dev = torch.device('cuda', rank)
 
   m = Picoformer(cfg)
-  m.init_weights()
+  if args.pretrained:
+    path = hf_hub_download(args.pretrained, filename="model.safetensors")
+    state_dict = {}
+    with safe_open(path, 'pt') as f:
+      for k in f.keys():
+        state_dict[k] = f.get_tensor(k)
+    m.load_state_dict(state_dict)
+  else:
+    m.init_weights()
+
   size = f'{sum(p.numel() for p in m.parameters()) / 2**20:.0f}M'
   print(size)
   m.to(dev)
 
-  from datasets import load_from_disk, load_dataset
-  train = load_from_disk('train_fens')
-
-  valid = load_from_disk('valid_fens')
-
   name = args.run_name or f'pico-{size}_bs{bs}_lr{args.muon_lr}'
-  run = wandb.init(project='puzzle', name=name, config=vars(args))
+  run = wandb.init(project='puzzle', name=name, config=vars(args)) if rank0 else None
   opt = m.init_opt(muon_lr=args.muon_lr, embd_lr=args.embd_lr, head_lr=args.head_lr, weight_decay=args.weight_decay, adam_beta1=args.adam_beta1, adam_beta2=args.adam_beta2, muon_momentum=args.muon_momentum, ns_steps=args.ns_steps)
   m.train()
-  m = torch.compile(m, mode="reduce-overhead")
-  total_steps = math.floor(len(train)/bs)
+  raw_model = m
+  if ddp:
+    m = DDP(m, device_ids=[rank])
+
+  train_data = BinDataset(args.train_bin, rank, world)
+  valid_data = BinDataset(args.valid_bin, rank, world)
+
+  m = torch.compile(m)
+  total_steps = len(train_data) // bs
   warmdown_steps = round(total_steps * 0.1)
-  loader = DataLoader(FenDataset(train), batch_size=bs, num_workers=4,persistent_workers=True,pin_memory=True, drop_last=True)
-  eval_loader = DataLoader(FenDataset(valid), batch_size=bs, num_workers=4,persistent_workers=True,pin_memory=True, drop_last=True)
-  tbar = tqdm(map(lambda b: b.to(dev, non_blocking=True).long(), loader), total=total_steps)
+  save_every = max(1, round(total_steps * 0.1))
+  loader = DataLoader(train_data, batch_size=bs, num_workers=2,persistent_workers=True,pin_memory=True, drop_last=True, prefetch_factor=4)
+  eval_loader = DataLoader(valid_data, batch_size=bs, num_workers=2,persistent_workers=True,pin_memory=True, drop_last=False)
+  tbar = tqdm(map(lambda b: b.to(dev, non_blocking=True).long(), loader), total=total_steps, disable=not rank0)
   torch.cuda.synchronize()
   window_t = time()
   window_tokens = 0
@@ -264,7 +297,7 @@ if __name__ == '__main__':
 
     loss.backward()
     torch.nn.utils.clip_grad_norm_(m.parameters(), args.grad_clip)
-    opt.set_lr_mult(wsd_lr_mult(ix, args.warmup_steps, warmdown_steps, args.final_lr_mult))
+    opt.set_lr_mult(wsd_lr_mult(ix, total_steps, args.warmup_steps, warmdown_steps, args.final_lr_mult))
 
     opt.step()
     opt.zero_grad()
@@ -273,31 +306,47 @@ if __name__ == '__main__':
     if ix % 10 == 0:
       torch.cuda.synchronize()
       t1 = time()
-      stat = {"loss": loss.item(), "lr": args.muon_lr * wsd_lr_mult(ix, args.warmup_steps, warmdown_steps, args.final_lr_mult), "tps": window_tokens / (t1 - window_t)}
+      stat = {"loss": loss.item(), "lr": args.muon_lr * wsd_lr_mult(ix, total_steps, args.warmup_steps, warmdown_steps, args.final_lr_mult), "tps": window_tokens / (t1 - window_t) * world}
       window_t = t1
       window_tokens = 0
       tbar.set_postfix(stat)
-      run.log(stat, step=ix)
+      if rank0:
+        run.log(stat, step=ix)
 
     if ix > 0 and (ix % args.eval_every == 0 or ix == total_steps - 1):
       m.eval()
       with torch.no_grad():
-        eval_losses = []
-        eval_tbar = tqdm(map(lambda b: b.to(dev, non_blocking=True).long(), eval_loader), total=math.floor(len(valid)/bs))
+        local_sum = torch.zeros((), device=dev)
+        local_cnt = torch.zeros((), device=dev)
+        eval_tbar = tqdm(map(lambda b: b.to(dev, non_blocking=True).long(), eval_loader), total=math.ceil(len(valid_data)/bs), disable=not rank0)
         for eval_batch in eval_tbar:
           eval_labels = eval_batch[:, 1:].contiguous()
           eval_inputs = eval_batch[:, :-1].contiguous()
           eval_loss = m(eval_inputs, labels=eval_labels)
-          eval_losses.append(eval_loss * len(eval_batch))
-        eval_loss = sum(eval_losses) / len(valid)
-        run.log({"eval_loss": eval_loss.item()}, step=ix)
+          local_sum += eval_loss * len(eval_batch)
+          local_cnt += len(eval_batch)
+        if ddp:
+          dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+          dist.all_reduce(local_cnt, op=dist.ReduceOp.SUM)
+        eval_loss = local_sum / local_cnt
+        if rank0:
+          run.log({"eval_loss": eval_loss.item()}, step=ix)
       m.train()
-  run.finish()
 
-  os.makedirs(f"ckpts/{name}", exist_ok=True)
-  save_file(m._orig_mod.state_dict(), f"ckpts/{name}/model.safetensors")
+    if rank0 and ix > 0 and ix % save_every == 0:
+      os.makedirs(f"ckpts/{name}", exist_ok=True)
+      save_file(raw_model.state_dict(), f"ckpts/{name}/model_{ix}.safetensors")
+  if rank0:
+    run.finish()
 
-  out_tokens = m.generate(torch.ones(1024,1,dtype=torch.long).to(m.device) * 13)
-  out = [decode(x) for x in out_tokens]
-  is_valid = sum([b.is_valid() for b in out]) / len(out)
-  print(f'is valid: {is_valid*100:.1f}%')
+  if rank0:
+    os.makedirs(f"ckpts/{name}", exist_ok=True)
+    save_file(raw_model.state_dict(), f"ckpts/{name}/model.safetensors")
+
+    out_tokens = raw_model.generate(torch.ones(1024,1,dtype=torch.long).to(dev) * 13)
+    out = [decode(x) for x in out_tokens]
+    is_valid = sum([b.is_valid() for b in out]) / len(out)
+    print(f'is valid: {is_valid*100:.1f}%')
+  if ddp:
+    dist.barrier(device_ids=[rank])
+    dist.destroy_process_group()
