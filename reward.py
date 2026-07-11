@@ -26,7 +26,7 @@ match sys.platform:
   case 'linux':
     stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-avx2"
 
-if (cpu_count := os.environ.get("CPU_CORES")) is None:
+if (cpu_count := os.environ.get("CPU_COUNT")) is None:
   cgroupd = "/sys/fs/cgroup/"
   if os.path.exists(cgroupd+"cpu.max"):
     with open(cgroupd+"cpu.max") as f:
@@ -47,9 +47,11 @@ else:
   cpu_count = int(cpu_count)
 
 stockfishcfg = {"Threads": 1, "Hash": 1024}
-stockfish_meganodes = int(os.environ.get("MEGANODES", 1))
-stockfish_maxdepth = 40
+stockfish_meganodes = int(os.environ.get("MEGANODES", 4))
+print(f'{stockfish_meganodes=}')
+stockfish_maxdepth = 32
 stockfish_limit = chess.engine.Limit(nodes=stockfish_meganodes * 1_000_000, time=40, depth=stockfish_maxdepth)
+print(f'{stockfish_limit=}')
 
 def win_chances(score: Score) -> float:
   mate = score.mate()
@@ -143,7 +145,7 @@ PIECE_VALUES = {
 }
 
 def search_features(x):
-  if not x.get("valid", True):
+  if not x.get("legal", True):
     return {"penalty": 0.0}
 
   b = x if isinstance(x, chess.Board) else getboard(x)
@@ -166,7 +168,7 @@ def search_features(x):
   return {"penalty": acc}
 
 def evaluate(x):
-  if not x.get("valid", True):
+  if not x.get("legal", True):
     return {"evaluation": None, "top": None, "second": None, "max_depth": 0}
 
   with chess.engine.SimpleEngine.popen_uci(stockfishpath) as engine:
@@ -191,7 +193,7 @@ def evaluate(x):
           })
 
       if not evaluation:
-        return {"valid": False, "evaluation": [], "top": None, "second": None, "max_depth": 0}
+        return {"legal": False, "evaluation": [], "top": None, "second": None, "max_depth": 0}
       max_depth = max(xx['depth'] for xx in evaluation)
       top = next(xx for xx in evaluation if xx['depth'] == max_depth and xx['multipv'] == 1)
       try:
@@ -208,7 +210,7 @@ def evaluate(x):
 def is_realistic(board: chess.Board) -> bool:
   for color in [chess.WHITE, chess.BLACK]:
     if len(board.pieces(chess.PAWN, color)) > 8: return False
-    if len(board.pieces(chess.QUEEN, color)) > 2: return False
+    if len(board.pieces(chess.QUEEN, color)) > 1: return False
     if len(board.pieces(chess.ROOK, color)) > 2: return False
     if len(board.pieces(chess.BISHOP, color)) > 2: return False
     if len(board.pieces(chess.KNIGHT, color)) > 2: return False
@@ -219,19 +221,43 @@ def reward(fen, **kwargs):
   fen_distance_threshold = 6
   pv_distance_threshold = 0.3
 
-  invalid = {"score": -2.0, "counterint": 0.0, "uniqueness": 0.0, "penalty": 0.0, "valid": 0.0, "is_cnt": 0.0, "is_unq": 0.0, "puzzle_distance": None, "batch_fen_distance": None, "batch_pv_distance": None, "puzzle": None}
-
   board = chess.Board(fen)
+  out = {
+    "FEN": fen,
+    "score": -2.0,
+    "legal": False,
+    "is_unreal": False,
+    "is_already_mated": False,
+    "n_pieces": float(len(board.piece_map())),
+    "capture_material": 0.0,
+    "depth_cp": 0.0,
+    "penalty": 0.0,
+    "uniqueness": 0.0,
+    "counterint": 0.0,
+    "sf_meganodes": 0.0,
+    "sf_depth": 0,
+    "sf_time": 0.0,
+    "n_positions": 0,
+    "n_unique_positions": 0,
+    "pv": "",
+    "is_unique": False,
+    "is_counterint": False,
+    "is_puzzle": False,
+    "puzzle_distance": None,
+    "batch_fen_distance": None,
+    "batch_pv_distance": None,
+    "positions": [],
+  }
   try:
     if not board.is_valid():
-      print(f"invalid board: {fen}")
-      return invalid
+      print(f"illegal board: {fen}")
+      return out
     if not is_realistic(board):
       print(f"unreal: {fen}")
-      return invalid
+      return {**out, "legal": True, "is_unreal": True, "score": 0.0}
     if board.is_checkmate():
       print(f"already mated: {fen}")
-      return invalid
+      return {**out, "legal": True, "is_already_mated": True}
 
     expanded_fen = expand_fen(fen)
     puzzle_distance = min_fen_distance(expanded_fen)
@@ -239,24 +265,27 @@ def reward(fen, **kwargs):
 
     if len(puzzle.positions) == 0:
       print(f"no positions: {fen}")
-      return invalid
+      return {**out, "legal": True}
 
   except Exception as e:
     print(f"Exception in `reward`: {e}\nFEN: {fen}")
     traceback.print_exc()
-    return invalid
+    return out
 
-  is_cnt = float(puzzle.metrics['counterint'] > tau_cnt)
-  is_unq = float(puzzle.uniqueness > tau_unq)
+  uniqueness = puzzle.measures['uniqueness']
+  counterint = puzzle.measures['counterint']
+  is_counterint = counterint > tau_cnt
+  is_unique = uniqueness > tau_unq
 
   # for other variants
-  score = kwargs.get('select_score')(is_unq, is_cnt) if 'select_score' in kwargs else float(is_unq and is_cnt)
+  score = kwargs.get('select_score')(is_unique, is_counterint) if 'select_score' in kwargs else float(is_unique and is_counterint)
 
   prior_samples = read_scored_samples()
   prior_fens = [s['expanded_fen'] for s in prior_samples]
   prior_pvs = [s['pv'] for s in prior_samples]
   batch_fen_distance = min_fen_distance(expanded_fen, prior_fens)
-  pv_str = " ".join(puzzle.positions[0].eval['top']['pv']) if puzzle.positions[0].eval['top'] else ""
+  first_top = json.loads(puzzle.positions[0].evaluation)['top']
+  pv_str = " ".join(first_top['pv']) if first_top else ""
   batch_pv_distance = min_pv_distance(pv_str, prior_pvs)
 
   if score == 1:
@@ -267,10 +296,32 @@ def reward(fen, **kwargs):
       print(f"too similar pv: {pv_str}")
       score = 0.0
     else:
-      append_scored_sample({"fen": fen, "expanded_fen": expanded_fen, "pv": pv_str, "score": score, "uniqueness": puzzle.uniqueness, "counterint": puzzle.metrics['counterint'], "batch_fen_distance": batch_fen_distance, "batch_pv_distance": batch_pv_distance})
-      pprint(f"cnt={puzzle.metrics['counterint']:.2f} [green]✓[/] | unq={puzzle.uniqueness:.2f} [green]✓[/] | fen_d={f'{batch_fen_distance:.2f}' if batch_fen_distance is not None else None} | pv_d={f'{batch_pv_distance:.2f}' if batch_pv_distance is not None else None} | fen={fen}")
+      append_scored_sample({"fen": fen, "expanded_fen": expanded_fen, "pv": pv_str, "score": score, "uniqueness": uniqueness, "counterint": counterint, "batch_fen_distance": batch_fen_distance, "batch_pv_distance": batch_pv_distance})
+      pprint(f"cnt={counterint:.2f} [green]✓[/] | unq={uniqueness:.2f} [green]✓[/] | fen_d={f'{batch_fen_distance:.2f}' if batch_fen_distance is not None else None} | pv_d={f'{batch_pv_distance:.2f}' if batch_pv_distance is not None else None} | fen={fen}")
 
-  return {"score": score, "counterint": puzzle.metrics['counterint'], "uniqueness": puzzle.uniqueness, "penalty": puzzle.metrics['penalty'], "valid": 1.0, "is_cnt": is_cnt, "is_unq": is_unq, "puzzle_distance": puzzle_distance, "batch_fen_distance": batch_fen_distance, "batch_pv_distance": batch_pv_distance, "puzzle": asdict(puzzle)}
+  return {
+    **out,
+    "score": score,
+    "legal": True,
+    "capture_material": puzzle.measures['capture_material'],
+    "depth_cp": puzzle.measures['depth_cp'],
+    "penalty": puzzle.measures['penalty'],
+    "uniqueness": uniqueness,
+    "counterint": counterint,
+    "sf_meganodes": puzzle.measures['sf_meganodes'],
+    "sf_depth": puzzle.measures['sf_depth'],
+    "sf_time": puzzle.measures['sf_time'],
+    "n_positions": len(puzzle.positions),
+    "n_unique_positions": sum(p.measures['is_unique'] for p in puzzle.positions),
+    "pv": pv_str,
+    "is_unique": is_unique,
+    "is_counterint": is_counterint,
+    "is_puzzle": is_unique and is_counterint,
+    "puzzle_distance": puzzle_distance,
+    "batch_fen_distance": batch_fen_distance,
+    "batch_pv_distance": batch_pv_distance,
+    "positions": [asdict(p) for p in puzzle.positions],
+  }
 
 def reward_uniq(*args, **kwargs):
   x = reward(*args, **{**kwargs, "select_score": lambda is_unq, is_cnt: float(is_unq)})
@@ -300,7 +351,7 @@ def average_precision(scores, labels, reverse=True):
   return np.mean(aps)
 
 def penalty(x, top_move):
-  if not x.get("valid", True):
+  if not x.get("legal", True):
     return {"penalty": 0.0}
 
   b = x if isinstance(x, chess.Board) else getboard(x)
@@ -324,18 +375,14 @@ def penalty(x, top_move):
 
 @dataclass
 class Position:
-  fen: str
-  top_move: str
-  eval: dict
-  uniqueness: float
-  metrics: dict
-  is_unique: bool
+  FEN: str
+  measures: dict
+  evaluation: str
 
 @dataclass
 class Puzzle:
   positions: list[Position]
-  uniqueness: float
-  metrics: dict
+  measures: dict
 
 def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
   b = chess.Board(fen)
@@ -370,11 +417,23 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
     capture_material = -PIECE_VALUES.get(captured.piece_type, 0) / 9.0 if captured else 0.0
     cint_og = depth_cp * 0.8 + capture_material * 0.1
 
+    measures = {
+      "top_move": top_move,
+      "uniqueness": unq,
+      "counterint": cint_og,
+      "penalty": pnlt,
+      "depth_cp": depth_cp,
+      "capture_material": capture_material,
+      "is_unique": unq >= uniqueness_threshold,
+      "sf_meganodes": max(xx['nodes'] for xx in eval['evaluation']) / 1e6,
+      "sf_depth": eval['max_depth'],
+      "sf_time": max(xx['time'] for xx in eval['evaluation']),
+    }
+    positions.append(Position(FEN=b.fen(), measures=measures, evaluation=json.dumps(eval)))
+
     if unq < uniqueness_threshold:
-      positions.append(Position(fen=b.fen(), top_move=top_move, eval=eval, uniqueness=unq, metrics={"counterint": cint_og, "penalty": pnlt}, is_unique=False))
       break
 
-    positions.append(Position(fen=b.fen(), top_move=top_move, eval=eval, uniqueness=unq, metrics={"counterint": cint_og, "penalty": pnlt}, is_unique=True))
     b.push_uci(top_move)
 
     if b.is_game_over():
@@ -391,24 +450,23 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
     if b.is_game_over():
       break
 
-  unique_positions = [p for p in positions if p.is_unique]
+  unique_positions = [p for p in positions if p.measures["is_unique"]]
   src = unique_positions if unique_positions else positions
   if not src:
-    return Puzzle(positions=positions, uniqueness=0.0, metrics={"counterint": 0.0, "penalty": 0.0})
-  mean_uniqueness = np.mean([p.uniqueness for p in src])
-  mean_cint = np.mean([p.metrics["counterint"] for p in src])
-  mean_pnlt = np.mean([p.metrics["penalty"] for p in src])
-  return Puzzle(positions=positions, uniqueness=mean_uniqueness, metrics={"counterint": mean_cint, "penalty": mean_pnlt})
+    return Puzzle(positions=positions, measures={"uniqueness": 0.0, "counterint": 0.0, "penalty": 0.0, "depth_cp": 0.0, "capture_material": 0.0, "sf_meganodes": 0.0, "sf_depth": 0, "sf_time": 0.0})
+  measures = {k: float(np.mean([p.measures[k] for p in src])) for k in ["uniqueness", "counterint", "penalty", "depth_cp", "capture_material"]}
+  measures |= {k: max(p.measures[k] for p in positions) for k in ["sf_meganodes", "sf_depth", "sf_time"]}
+  return Puzzle(positions=positions, measures=measures)
 
 def test_puzzles():
   from datasets import load_dataset
   xs = load_dataset("Lichess/chess-puzzles", split="train[:2500]")
   xs = xs.map(lambda x: reward(getboard(x)), num_proc=cpu_count)
 
-  is_unq_count = sum(xs['is_unq'])
-  is_cnt_count = sum(xs['is_cnt'])
-  both_count = sum(1 for u, c in zip(xs['is_unq'], xs['is_cnt']) if u and c)
-  valid_count = sum(xs['valid'])
+  is_unq_count = sum(xs['is_unique'])
+  is_cnt_count = sum(xs['is_counterint'])
+  both_count = sum(1 for u, c in zip(xs['is_unique'], xs['is_counterint']) if u and c)
+  valid_count = sum(xs['legal'])
 
   print(f"Total puzzles: {len(xs)}")
   print(f"Valid: {valid_count} ({valid_count/len(xs)*100:.1f}%)")
@@ -445,15 +503,15 @@ def test_goldenset():
   train = train.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=cpu_count)
   allset = concatenate_datasets([train, valid])
 
-  ap_uniq_valid = average_precision([m['uniqueness'] for m in valid], valid['label'])
-  ap_uniq_train = average_precision([m['uniqueness'] for m in train], train['label'])
-  ap_uniq_allset = average_precision([m['uniqueness'] for m in allset], allset['label'])
-  ap_heurstic_valid = average_precision([m['penalty'] for m in valid['metrics']], valid['label'])
-  ap_heurstic_train = average_precision([m['penalty'] for m in train['metrics']], train['label'])
-  ap_heurstic_allset = average_precision([m['penalty'] for m in allset['metrics']], allset['label'])
-  apvalid = average_precision([m['counterint'] for m in valid['metrics']], valid['label'])
-  aptrain = average_precision([m['counterint'] for m in train['metrics']], train['label'])
-  apallset = average_precision([m['counterint'] for m in allset['metrics']], allset['label'])
+  ap_uniq_valid = average_precision([m['uniqueness'] for m in valid['measures']], valid['label'])
+  ap_uniq_train = average_precision([m['uniqueness'] for m in train['measures']], train['label'])
+  ap_uniq_allset = average_precision([m['uniqueness'] for m in allset['measures']], allset['label'])
+  ap_heurstic_valid = average_precision([m['penalty'] for m in valid['measures']], valid['label'])
+  ap_heurstic_train = average_precision([m['penalty'] for m in train['measures']], train['label'])
+  ap_heurstic_allset = average_precision([m['penalty'] for m in allset['measures']], allset['label'])
+  apvalid = average_precision([m['counterint'] for m in valid['measures']], valid['label'])
+  aptrain = average_precision([m['counterint'] for m in train['measures']], train['label'])
+  apallset = average_precision([m['counterint'] for m in allset['measures']], allset['label'])
 
   table = Table(title=f"@ {stockfish_meganodes}MN", box=rich_box.ASCII)
   table.add_column("Metric")
@@ -468,7 +526,7 @@ def test_goldenset():
   fig, ax = plt.subplots(figsize=(12, 6))
   for label, color in [(0, 'blue'), (1, 'red')]:
     idxs = [i for i, l in enumerate(train['label']) if l == label]
-    vals = [train['uniqueness'][i] for i in idxs]
+    vals = [train['measures'][i]['uniqueness'] for i in idxs]
     jitter = np.random.default_rng(0).uniform(-0.2, 0.2, len(vals))
     y_pos = label + jitter
     ax.scatter(vals, y_pos, alpha=0.6, color=color, s=20, label=f'label={label}')
