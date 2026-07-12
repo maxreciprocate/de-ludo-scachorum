@@ -60,6 +60,16 @@ def decode(tokens):
   return board
 
 DTYPE = torch.bfloat16
+# from kernels import get_kernel
+# flash_attn_4 = get_kernel("SecondNatureComputing/flash-attn-4-sm120", trust_remote_code=True, version=0)
+
+from kernels import get_kernel
+kernel_module = get_kernel("kernels-community/flash-attn2", version=2)
+flash_attn_func = kernel_module.flash_attn_func
+
+# import sys, importlib
+# sys.path.insert(0, "flash-attn-4-sm120/build/")
+# flash_attn_4 = importlib.import_module("flash_attn_4_sm120")
 
 @dataclass
 class Config:
@@ -94,9 +104,12 @@ class MHA(nn.Module):
 
   def forward(self, x):
     B, T, D = x.shape
-    q, k, v = (t.view(B, T, self.cfg.heads, D//self.cfg.heads).transpose(1, 2) for t in self.qkv(x).chunk(3, dim=-1))
+    # q, k, v = (t.view(B, T, self.cfg.heads, D//self.cfg.heads).transpose(1, 2) for t in self.qkv(x).chunk(3, dim=-1))
+    q, k, v = (t.view(B, T, self.cfg.heads, D//self.cfg.heads) for t in self.qkv(x).chunk(3, dim=-1))
     q, k = norm(q), norm(k)
-    y = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2)
+    # y = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2)
+    y = flash_attn_func(q, k, v, causal=True)
+    # y, _ = flash_attn_4.flash_attn_func(q, k, v, causal=True)
     y = y.contiguous().view(B, T, D)
     y = self.o(y)
     return y
@@ -229,7 +242,7 @@ if __name__ == '__main__':
   parser.add_argument("--weight_decay", type=float, default=0.0)
   parser.add_argument("--warmup_steps", type=int, default=100)
   parser.add_argument("--final_lr_mult", type=float, default=0.1)
-  parser.add_argument("--muon_momentum", type=float, default=0.95)
+  parser.add_argument("--muon_momentum", type=float, default=0.9)
   parser.add_argument("--ns_steps", type=int, default=5)
   parser.add_argument("--grad_clip", type=float, default=1.0)
   parser.add_argument("--eval_every", type=int, default=10_000)
@@ -240,7 +253,7 @@ if __name__ == '__main__':
 
   configs = {
     "12M":  (Config(dim=256,layers=16,heads=4), 3072),
-    "192M": (Config(dim=1024,layers=16,heads=8), 640),
+    "192M": (Config(dim=1024,layers=16,heads=8), 740),
   }
   cfg, bs = configs[args.model]
   ddp = 'RANK' in os.environ
