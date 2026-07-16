@@ -9,8 +9,8 @@ import uuid
 import chess
 import chess.engine
 import numpy as np
-from chess import Move
-from chess.engine import Mate, Score
+from chess import Move 
+from chess.engine import Score, Mate
 from datasets import Dataset, concatenate_datasets, load_dataset
 from rapidfuzz.distance import Levenshtein
 from rich import print as pprint
@@ -19,12 +19,15 @@ from rich.console import Console
 from rich import box as rich_box
 from dataclasses import asdict, dataclass
 from matplotlib import pyplot as plt
+import datasets
+datasets.disable_caching()
 
 match sys.platform:
   case 'darwin':
     stockfishpath = "/opt/homebrew/bin/stockfish"
   case 'linux':
-    stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-avx2"
+    # stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-avx2"
+    stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-bmi2"
 
 if (cpu_count := os.environ.get("CPU_COUNT")) is None:
   cgroupd = "/sys/fs/cgroup/"
@@ -46,10 +49,10 @@ if (cpu_count := os.environ.get("CPU_COUNT")) is None:
 else:
   cpu_count = int(cpu_count)
 
-stockfishcfg = {"Threads": 1, "Hash": 1024}
+stockfishcfg = {"Threads": 1, "Hash": 4096}
 stockfish_meganodes = int(os.environ.get("MEGANODES", 4))
 print(f'{stockfish_meganodes=}')
-stockfish_maxdepth = 32
+stockfish_maxdepth = 40
 stockfish_limit = chess.engine.Limit(nodes=stockfish_meganodes * 1_000_000, time=40, depth=stockfish_maxdepth)
 print(f'{stockfish_limit=}')
 
@@ -234,6 +237,7 @@ def reward(fen, **kwargs):
     "penalty": 0.0,
     "uniqueness": 0.0,
     "counterint": 0.0,
+    "nodefrac": 0.0,
     "sf_meganodes": 0.0,
     "sf_depth": 0,
     "sf_time": 0.0,
@@ -274,8 +278,10 @@ def reward(fen, **kwargs):
 
   uniqueness = puzzle.measures['uniqueness']
   counterint = puzzle.measures['counterint']
-  is_counterint = counterint > tau_cnt
-  is_unique = uniqueness > tau_unq
+  print(puzzle.measures)
+  nodefrac = puzzle.measures['nodefrac']
+  is_counterint = counterint >= tau_cnt
+  is_unique = uniqueness >= tau_unq
 
   # for other variants
   score = kwargs.get('select_score')(is_unique, is_counterint) if 'select_score' in kwargs else float(is_unique and is_counterint)
@@ -308,6 +314,7 @@ def reward(fen, **kwargs):
     "penalty": puzzle.measures['penalty'],
     "uniqueness": uniqueness,
     "counterint": counterint,
+    "nodefrac": nodefrac,
     "sf_meganodes": puzzle.measures['sf_meganodes'],
     "sf_depth": puzzle.measures['sf_depth'],
     "sf_time": puzzle.measures['sf_time'],
@@ -331,7 +338,7 @@ def average_precision(scores, labels, reverse=True):
   paired = list(zip(scores, labels))
 
   aps = []
-  for seed in range(1000):
+  for seed in range(100):
     # if there are multiple equivalent scores they need to be shuffled 100 times
     np.random.default_rng(seed).shuffle(paired)
     paired.sort(key=lambda x: x[0], reverse=reverse)
@@ -394,7 +401,7 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
       print(f"eval.top == None -> {b.fen()}")
       break
 
-    if eval['second'] and 0 < eval['top']['score'].get('moves', np.inf) <= 1 and 0 < eval['second']['score'].get('moves', np.inf) <= 1:
+    if eval['second'] and 0 < eval['top']['score'].get('moves', np.inf) <= 15 and 0 < eval['second']['score'].get('moves', np.inf) <= 15:
       with chess.engine.SimpleEngine.popen_uci(stockfishpath) as engine:
         engine.configure(stockfishcfg)
         info = engine.analyse(b, limit=stockfish_limit, multipv=32)
@@ -404,14 +411,25 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
           unq = 2.0
         else:
           unq = 1.0 - win_chances(scores[nmates])
+
+    # m_top = eval['top']['score'].get('moves', 1000)
+    # m_second = eval['second']['score'].get('moves', 1000) if eval['second'] else 1000
+    # both_mate = 0 < m_top < 1000 and 0 < m_second < 1000
+    # if both_mate:
+    #   unq = 2.0
+
     elif eval['second']:
       unq = eval['top']['winprob'] - eval['second']['winprob']
     else:
       unq = 2.0
 
     top_move = eval['top']['move']
-    top_move_pv1_depths = [xx['depth'] for xx in eval['evaluation'] if xx['move'] == top_move and xx['multipv'] == 1]
-    depth_cp = min(top_move_pv1_depths, default=1) / stockfish_maxdepth
+    pv1 = [xx for xx in eval['evaluation'] if xx['multipv'] == 1]
+    last_disagree_depth = max((xx['depth'] for xx in pv1 if xx['move'] != top_move), default=0)
+    critical_depth = min((xx['depth'] for xx in pv1 if xx['move'] == top_move and xx['depth'] > last_disagree_depth), default=eval['max_depth'])
+    depth_cp = critical_depth / stockfish_maxdepth
+    disagree_nodes = max((xx['nodes'] for xx in eval['evaluation'] if xx['multipv'] == 1 and xx['move'] != top_move), default=0)
+    nodefrac = disagree_nodes / max(eval['top']['nodes'], 1)
     pnlt = penalty({"FEN": b.fen()}, top_move)['penalty']
     captured = b.piece_at(chess.Move.from_uci(top_move).to_square)
     capture_material = -PIECE_VALUES.get(captured.piece_type, 0) / 9.0 if captured else 0.0
@@ -419,12 +437,14 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
 
     measures = {
       "top_move": top_move,
+      # "both_mate": both_mate,
       "uniqueness": unq,
       "counterint": cint_og,
+      "nodefrac": nodefrac,
       "penalty": pnlt,
       "depth_cp": depth_cp,
       "capture_material": capture_material,
-      "is_unique": unq >= uniqueness_threshold,
+      "is_unique": unq > uniqueness_threshold,
       "sf_meganodes": max(xx['nodes'] for xx in eval['evaluation']) / 1e6,
       "sf_depth": eval['max_depth'],
       "sf_time": max(xx['time'] for xx in eval['evaluation']),
@@ -454,7 +474,7 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
   src = unique_positions if unique_positions else positions
   if not src:
     return Puzzle(positions=positions, measures={"uniqueness": 0.0, "counterint": 0.0, "penalty": 0.0, "depth_cp": 0.0, "capture_material": 0.0, "sf_meganodes": 0.0, "sf_depth": 0, "sf_time": 0.0})
-  measures = {k: float(np.mean([p.measures[k] for p in src])) for k in ["uniqueness", "counterint", "penalty", "depth_cp", "capture_material"]}
+  measures = {k: float(np.mean([p.measures[k] for p in src])) for k in ["uniqueness", "counterint", "penalty", "depth_cp", "capture_material", "nodefrac"]}
   measures |= {k: max(p.measures[k] for p in positions) for k in ["sf_meganodes", "sf_depth", "sf_time"]}
   return Puzzle(positions=positions, measures=measures)
 
@@ -503,9 +523,9 @@ def test_goldenset():
   train = train.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=cpu_count)
   allset = concatenate_datasets([train, valid])
 
-  ap_uniq_valid = average_precision([m['uniqueness'] for m in valid['measures']], valid['label'])
-  ap_uniq_train = average_precision([m['uniqueness'] for m in train['measures']], train['label'])
-  ap_uniq_allset = average_precision([m['uniqueness'] for m in allset['measures']], allset['label'])
+  ap_uniq_valid = average_precision([float(m['uniqueness'] >= 0.5) for m in valid['measures']], valid['label'])
+  ap_uniq_train = average_precision([float(m['uniqueness'] >= 0.5) for m in train['measures']], train['label'])
+  ap_uniq_allset = average_precision([float(m['uniqueness'] >= 0.5) for m in allset['measures']], allset['label'])
   ap_heurstic_valid = average_precision([m['penalty'] for m in valid['measures']], valid['label'])
   ap_heurstic_train = average_precision([m['penalty'] for m in train['measures']], train['label'])
   ap_heurstic_allset = average_precision([m['penalty'] for m in allset['measures']], allset['label'])
