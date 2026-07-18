@@ -52,8 +52,8 @@ else:
 stockfishcfg = {"Threads": 1, "Hash": 4096}
 stockfish_meganodes = int(os.environ.get("MEGANODES", 4))
 print(f'{stockfish_meganodes=}')
-stockfish_maxdepth = 40
-stockfish_limit = chess.engine.Limit(nodes=stockfish_meganodes * 1_000_000, time=40, depth=stockfish_maxdepth)
+stockfish_maxdepth = 50
+stockfish_limit = chess.engine.Limit(nodes=stockfish_meganodes * 1_000_000, time=10, depth=stockfish_maxdepth)
 print(f'{stockfish_limit=}')
 
 def win_chances(score: Score) -> float:
