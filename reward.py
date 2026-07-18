@@ -19,6 +19,7 @@ from rich.console import Console
 from rich import box as rich_box
 from dataclasses import asdict, dataclass
 from matplotlib import pyplot as plt
+from blob import pretty_dict
 import datasets
 datasets.disable_caching()
 
@@ -26,8 +27,8 @@ match sys.platform:
   case 'darwin':
     stockfishpath = "/opt/homebrew/bin/stockfish"
   case 'linux':
-    # stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-avx2"
-    stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-bmi2"
+    stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-avx2"
+    # stockfishpath = "/workspace/stockfish/stockfish-ubuntu-x86-64-bmi2"
 
 if (cpu_count := os.environ.get("CPU_COUNT")) is None:
   cgroupd = "/sys/fs/cgroup/"
@@ -53,7 +54,7 @@ stockfishcfg = {"Threads": 1, "Hash": 4096}
 stockfish_meganodes = int(os.environ.get("MEGANODES", 4))
 print(f'{stockfish_meganodes=}')
 stockfish_maxdepth = 50
-stockfish_limit = chess.engine.Limit(nodes=stockfish_meganodes * 1_000_000, time=10, depth=stockfish_maxdepth)
+stockfish_limit = chess.engine.Limit(nodes=stockfish_meganodes * 1_000_000, time=40, depth=stockfish_maxdepth)
 print(f'{stockfish_limit=}')
 
 def win_chances(score: Score) -> float:
@@ -278,7 +279,7 @@ def reward(fen, **kwargs):
 
   uniqueness = puzzle.measures['uniqueness']
   counterint = puzzle.measures['counterint']
-  print(puzzle.measures)
+  print(pretty_dict(puzzle.measures))
   nodefrac = puzzle.measures['nodefrac']
   is_counterint = counterint >= tau_cnt
   is_unique = uniqueness >= tau_unq
@@ -424,10 +425,14 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
       unq = 2.0
 
     top_move = eval['top']['move']
-    pv1 = [xx for xx in eval['evaluation'] if xx['multipv'] == 1]
-    last_disagree_depth = max((xx['depth'] for xx in pv1 if xx['move'] != top_move), default=0)
-    critical_depth = min((xx['depth'] for xx in pv1 if xx['move'] == top_move and xx['depth'] > last_disagree_depth), default=eval['max_depth'])
-    depth_cp = critical_depth / stockfish_maxdepth
+    # pv1 = [xx for xx in eval['evaluation'] if xx['multipv'] == 1]
+    # last_disagree_depth = max((xx['depth'] for xx in pv1 if xx['move'] != top_move), default=0)
+    # critical_depth = min((xx['depth'] for xx in pv1 if xx['move'] == top_move and xx['depth'] > last_disagree_depth), default=eval['max_depth'])
+    # depth_cp = critical_depth / stockfish_maxdepth
+
+    top_move_pv1_depths = [xx['depth'] for xx in eval['evaluation'] if xx['move'] == top_move and xx['multipv'] == 1]
+    depth_cp = min(top_move_pv1_depths, default=1) / stockfish_maxdepth
+
     disagree_nodes = max((xx['nodes'] for xx in eval['evaluation'] if xx['multipv'] == 1 and xx['move'] != top_move), default=0)
     nodefrac = disagree_nodes / max(eval['top']['nodes'], 1)
     pnlt = penalty({"FEN": b.fen()}, top_move)['penalty']
@@ -559,10 +564,17 @@ def test_goldenset():
   ax.legend()
   plt.tight_layout()
   plt.show()
-# ;;
+
+def test_x():
+  x = "2b3k1/2r4p/p3pn1r/Pp1p1pK1/3P1Pp1/2PN4/1PB2P2/R6R b - - 0 1"
+  o = reward(x)
+  print(f'{o['n_unique_positions']=}')
+  for xx in o['positions']:
+    pretty_dict(xx['measures'])
 
 if __name__ == '__main__':
   test_goldenset()
+  # test_x()
   # test_distance()
   # x = fen_to_puzzle("8/8/6k1/4q1P1/8/5K2/8/8 b - - 3 3")
   # x.positions[0]
