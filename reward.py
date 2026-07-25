@@ -1,8 +1,12 @@
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 import sys
 import os
 import torch
 import fcntl
 import math
+import itertools
 import json
 import traceback
 import uuid
@@ -21,7 +25,6 @@ from dataclasses import asdict, dataclass
 from matplotlib import pyplot as plt
 from blob import pretty_dict
 from types import SimpleNamespace
-
 # import datasets
 # datasets.disable_caching()
 
@@ -55,8 +58,8 @@ else:
   cpu_count = int(cpu_count)
 
 stockfishcfg = {"Threads": 1, "Hash": 1024}
-stockfish_meganodes = int(os.environ.get("MEGANODES", 4))
-stockfish_maxdepth = 50
+stockfish_meganodes = int(os.environ.get("MEGANODES", 1))
+stockfish_maxdepth = 40
 stockfish_limit = chess.engine.Limit(nodes=stockfish_meganodes * 1_000_000, time=40, depth=stockfish_maxdepth)
 
 MAIA_ELOS = [1100, 1500, 1900, 2300, 2700]
@@ -189,29 +192,6 @@ PIECE_VALUES = {
   chess.KING: 0,
 }
 
-def search_features(x):
-  if not x.get("legal", True):
-    return {"penalty": 0.0}
-
-  b = x if isinstance(x, chess.Board) else getboard(x)
-  top_move = Move.from_uci(x['top']['move'])
-
-  acc = 0.0
-
-  is_in_check = b.is_check()
-  acc += -1.0 if is_in_check else 0.0
-
-  b.push(top_move)
-  gives_check = b.is_check()
-  b.pop()
-  acc += -0.4 if gives_check else 0.0
-
-  captured = b.piece_at(top_move.to_square)
-  if captured:
-    acc += -PIECE_VALUES.get(captured.piece_type, 0) / 9.0
-
-  return {"penalty": acc}
-
 def evaluate(x):
   if not x.get("legal", True):
     return {"evaluation": None, "top": None, "second": None, "max_depth": 0}
@@ -262,8 +242,7 @@ def is_realistic(board: chess.Board) -> bool:
   return True
 
 def reward(fen, **kwargs):
-  tau_unq, tau_cnt = 0.5, 0.1
-  tau_maia = 0.06
+  tau_unq, tau_cnt, tau_three = 0.5, 0.1, 0.4
   fen_distance_threshold = 6
   pv_distance_threshold = 0.3
 
@@ -324,21 +303,21 @@ def reward(fen, **kwargs):
     traceback.print_exc()
     return out
 
-  uniqueness = puzzle.measures['uniqueness']
-  counterint = puzzle.measures['counterint']
-  pretty_dict(puzzle.measures)
-  nodefrac = puzzle.measures['nodefrac']
-  is_counterint = counterint >= tau_cnt
-  is_maia_counterint = puzzle.measures['maia_rankfrac'] >= tau_maia
-  is_unique = uniqueness >= tau_unq
+  x = puzzle.measures
+  # these are just normalized to 1 via grid search with step 0.1
+  counterint_three = 0.333 * min(1, max(0, x['maia_rank']) / 40) + 0.333 * min(1, max(0, x['depth_cp']) / 40) + 0.333 * min(1, max(0, (x['penalty']+2.4)/2.4))
+
+  is_counterint = x['counterint'] >= tau_cnt
+  is_counterint_three = counterint_three >= tau_three
+  is_unique = x['uniqueness'] >= tau_unq
   # for other variants
-  score = kwargs.get('select_score')(is_unique, is_counterint, is_maia_counterint) if 'select_score' in kwargs else float(is_unique and is_counterint)
+  score = kwargs.get('select_score')(is_unique, is_counterint, is_counterint_three) if 'select_score' in kwargs else float(is_unique and is_counterint_three)
 
   prior_samples = read_scored_samples()
   prior_fens = [s['expanded_fen'] for s in prior_samples]
   prior_pvs = [s['pv'] for s in prior_samples]
   batch_fen_distance = min_fen_distance(expanded_fen, prior_fens)
-  first_top = json.loads(puzzle.positions[0].evaluation)['top']
+  first_top = puzzle.positions[0].evaluation['top']
   pv_str = " ".join(first_top['pv']) if first_top else ""
   batch_pv_distance = min_pv_distance(pv_str, prior_pvs)
 
@@ -350,41 +329,46 @@ def reward(fen, **kwargs):
       print(f"too similar pv: {pv_str}")
       score = 0.0
     else:
-      append_scored_sample({"fen": fen, "expanded_fen": expanded_fen, "pv": pv_str, "score": score, "uniqueness": uniqueness, "counterint": counterint, "batch_fen_distance": batch_fen_distance, "batch_pv_distance": batch_pv_distance})
-      pprint(f"cnt={counterint:.2f} [green]✓[/] | unq={uniqueness:.2f} [green]✓[/] | fen_d={f'{batch_fen_distance:.2f}' if batch_fen_distance is not None else None} | pv_d={f'{batch_pv_distance:.2f}' if batch_pv_distance is not None else None} | fen={fen}")
+      append_scored_sample({"fen": fen, "expanded_fen": expanded_fen, "pv": pv_str, "score": score, "uniqueness": x['uniqueness'], "counterint": x['counterint'], "batch_fen_distance": batch_fen_distance, "batch_pv_distance": batch_pv_distance})
+      pprint(f"cntj={counterint_three:.2f} [green]+[/] | unq={x['uniqueness']:.2f} [green]+[/] | fen_d={f'{batch_fen_distance:.2f}' if batch_fen_distance is not None else None} | pv_d={f'{batch_pv_distance:.2f}' if batch_pv_distance is not None else None} | fen={fen}")
 
-  return {
+  out = {
     **out,
     "score": score,
     "legal": True,
-    "capture_material": puzzle.measures['capture_material'],
-    "depth_cp": puzzle.measures['depth_cp'],
-    "depth_cp_norm": puzzle.measures['depth_cp_norm'],
-    "penalty": puzzle.measures['penalty'],
-    "uniqueness": uniqueness,
-    "counterint": counterint,
-    "maia_rankfrac": puzzle.measures['maia_rankfrac'],
-    "maia_surprise": puzzle.measures['maia_surprise'],
-    "maia_rank": puzzle.measures['maia_rank'],
-    "n_legal_moves": puzzle.measures['n_legal_moves'],
-    "nodefrac": nodefrac,
-    "sf_meganodes": puzzle.measures['sf_meganodes'],
-    "sf_depth": puzzle.measures['sf_depth'],
-    "sf_time": puzzle.measures['sf_time'],
+    "capture_material": x['capture_material'],
+    "depth_cp": x['depth_cp'],
+    "depth_cp_norm": x['depth_cp_norm'],
+    "penalty": x['penalty'],
+    "uniqueness": x['uniqueness'],
+    "counterint": x['counterint'],
+    "counterint_three": counterint_three,
+    "maia_rankfrac": x['maia_rankfrac'],
+    "maia_surprise": x['maia_surprise'],
+    "maia_rank": x['maia_rank'],
+    "n_legal_moves": x['n_legal_moves'],
+    "nodefrac": x['nodefrac'],
+    "sf_meganodes": x['sf_meganodes'],
+    "sf_depth": x['sf_depth'],
+    "sf_time": x['sf_time'],
     "n_positions": len(puzzle.positions),
     "n_unique_positions": sum(p.measures['is_unique'] for p in puzzle.positions),
     "pv": pv_str,
     "is_unique": is_unique,
     "is_counterint": is_counterint,
+    "is_counterint_three": is_counterint_three,
     "is_puzzle": is_unique and is_counterint,
+    "is_puzzle_three": is_unique and is_counterint_three,
     "puzzle_distance": puzzle_distance,
     "batch_fen_distance": batch_fen_distance,
     "batch_pv_distance": batch_pv_distance,
     "positions": [asdict(p) for p in puzzle.positions],
   }
+  # pretty_dict(out)
+  return out
 
 def reward_uniq(*args, **kwargs):
-  x = reward(*args, **{**kwargs, "select_score": lambda is_unq, is_cnt: float(is_unq)})
+  x = reward(*args, **{**kwargs, "select_score": lambda is_unq, is_cnt, is_cnt3: float(is_unq)})
   return x
 
 def average_precision(scores, labels, reverse=True):
@@ -513,7 +497,10 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
       "sf_depth": eval['max_depth'],
       "sf_time": max(xx['time'] for xx in eval['evaluation']),
     }
-    positions.append(Position(FEN=b.fen(), measures=measures, evaluation=json.dumps(eval)))
+
+    # just not storing this, takes too much space, i don't use it, sorry
+    eval.pop('evaluation')
+    positions.append(Position(FEN=b.fen(), measures=measures, evaluation=eval))
 
     if unq < uniqueness_threshold:
       break
@@ -537,7 +524,7 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
   unique_positions = [p for p in positions if p.measures["is_unique"]]
   src = unique_positions if unique_positions else positions
   if not src:
-    return Puzzle(positions=positions, measures={"uniqueness": 0.0, "counterint": 0.0, "maia_rankfrac": 0.0, "maia_surprise": 0.0, "maia_rank": 0.0, "n_legal_moves": 0.0, "penalty": 0.0, "depth_cp": 0.0, "depth_cp_norm": 0, "capture_material": 0.0, "sf_meganodes": 0.0, "sf_depth": 0, "sf_time": 0.0})
+    return Puzzle(positions=positions, measures={"uniqueness": 0.0, "counterint": 0.0, "maia_rankfrac": 0.0, "maia_surprise": 0.0, "maia_rank": 0.0, "n_legal_moves": 0.0, "penalty": 0.0, "depth_cp": 0.0, "depth_cp_norm": 0, "capture_material": 0.0, "nodefrac": 0.0, "sf_meganodes": 0.0, "sf_depth": 0, "sf_time": 0.0})
   measures = {k: float(np.mean([p.measures[k] for p in src])) for k in ["uniqueness", "counterint", "maia_rankfrac", "maia_surprise", "maia_rank", "n_legal_moves", "penalty", "depth_cp", "depth_cp_norm", "capture_material", "nodefrac"]}
   measures |= {k: max(p.measures[k] for p in positions) for k in ["sf_meganodes", "sf_depth", "sf_time"]}
   return Puzzle(positions=positions, measures=measures)
@@ -580,7 +567,6 @@ def test_distance():
   print(f"pv_distance: {d:.3f} {d2:.3f} {d3:.3f}")
   print("min_pv_distance ~ all good")
 
-# ;;
 def test_goldenset():
   valid = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-valid.jsonl"))
   train = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-train.jsonl"))
@@ -590,33 +576,143 @@ def test_goldenset():
   train = train.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=cpu_count)
   allset = concatenate_datasets([train, valid])
 
+  # these are just normalized to 1 via grid search with step 0.1
+  counterint_three = lambda x: 0.333 * min(1, max(0, x['maia_rank']) / 40) + 0.333 * min(1, max(0, x['depth_cp']) / 40) + 0.333 * min(1, max(0, (x['penalty']+2.4)/2.4))
+
   measures = [
+    ('joint', counterint_three),
+    ('rank+depth+penalty', lambda x: 0.4 * x['maia_rank']/40 + 0.9 * x['depth_cp']/40 + 0.2 * (x['penalty']+2.4)/2.4),
+    ('rank+depth+penalty', lambda x: x['maia_rank'] + x['depth_cp'] + x['penalty']),
+    ('rank+depth+surprise', lambda x: x['maia_surprise'] + x['maia_rank'] + x['depth_cp']),
+    ('rank+depth+surprise+penalty', lambda x: x['maia_surprise'] + x['maia_rank'] + x['depth_cp'] + x['penalty']),
+    ('rank+depth', lambda x: x['maia_rank'] + x['depth_cp']),
     ('maia_rank', lambda x: x['maia_rank']),
     ('counterint', lambda x: x['counterint']),
-    ('maia_rank+depth_cp+penalty', lambda x: x['maia_rank'] + x['depth_cp']),
+    ('depth+penalty', lambda x: x['depth_cp'] + x['penalty']),
+    ('depth+penalty (weight)', lambda x: 0.8*x['depth_cp'] + 0.1*x['penalty']),
+    ('rank+depth+penalty', lambda x: x['maia_rank'] + x['depth_cp']),
     ('uniqueness', lambda x: x['uniqueness']),
     ('penalty', lambda x: x['penalty']),
     ('depth_cp', lambda x: x['depth_cp']),
-    ('maia_rankfrac', lambda x: x['maia_rankfrac']),
-    ('maia_surprise', lambda x: x['maia_surprise']),
-    ('maia_rank+depth_cp', lambda x: x['maia_rank'] + x['depth_cp']),
-    ('maia_rank+2*depth_cp', lambda x: x['maia_rank'] + 2 * x['depth_cp']),
-    ('maia_rank+depth_cp+penalty', lambda x: x['depth_cp'] + x['maia_rank'] + x['penalty']),
+    ('rankfrac', lambda x: x['maia_rankfrac']),
+    ('surprise', lambda x: x['maia_surprise']),
+    ('rank+2*depth', lambda x: x['maia_rank'] + 2 * x['depth_cp']),
+    ('2*rank+depth', lambda x: 2* x['maia_rank'] + x['depth_cp']),
+    ('rank+depth+penalty', lambda x: x['depth_cp'] + x['maia_rank'] + x['penalty']),
   ]
+
+  def calc_f1(fn, selthr=None):
+    xxs = np.array([fn(x) for x in train['measures']])
+    xxs_valid = np.array([fn(x) for x in valid['measures']])
+    ys = np.array(train['label'])
+    ys_valid = np.array(valid['label'])
+
+    maxf1 = 0
+    maxthr = 0
+    for thr in np.concatenate([[xxs.min() - 1], np.unique(xxs)]):
+      pred = xxs > thr
+
+      recall = sum(yhat and y for yhat, y in zip(pred, ys)) / max(sum(ys), 1e-24)
+      if sum(pred):
+        precision = sum(yhat and y for yhat, y in zip(pred, ys)) / sum(pred)
+      else:
+        precision = 1e-24
+
+      if recall == 0 or precision == 0:
+        f1 = 0
+      else:
+        f1 = 2 / (1/recall + 1/precision)
+
+      if f1 > maxf1:
+        maxf1 = f1
+        maxthr = thr
+
+    maxthr = maxthr if selthr is None else selthr
+    pred_valid = xxs_valid > maxthr
+    recall = sum(yhat and y for yhat, y in zip(pred_valid, ys_valid)) / max(sum(ys_valid), 1e-24)
+    if sum(pred_valid):
+      precision = sum(yhat and y for yhat, y in zip(pred_valid, ys_valid)) / sum(pred_valid)
+    else:
+      precision = 1e-24
+
+    f1 = 2 / (1/recall + 1/precision)
+    return {"thr": maxthr, "valid-f1": f1, "valid-recall": recall, "valid-precision": precision}
 
   table = Table(title=f"@ {stockfish_meganodes}MN", box=rich_box.ASCII)
   table.add_column("Metric")
   table.add_column("Train")
   table.add_column("Test")
   table.add_column("Train+Test")
+  table.add_column("F1")
+  table.add_column("Prec")
+  table.add_column("Thr")
 
   for k, fn in measures:
     k_val = average_precision([fn(x) for x in valid['measures']], valid['label'])
     k_tra = average_precision([fn(x) for x in train['measures']], train['label'])
     k_all = average_precision([fn(x) for x in allset['measures']], allset['label'])
-    table.add_row(k, f"{k_tra:.4f}", f"{k_val:.4f}", f"{k_all:.4f}")
+    f1 = calc_f1(fn)['valid-f1']
+    prec = calc_f1(fn)['valid-precision']
+    thr = calc_f1(fn)['thr']
+    table.add_row(k, f"{k_tra:.4f}", f"{k_val:.4f}", f"{k_all:.4f}", f"{f1:.3f}", f"{prec:.3f}", f"{thr:.2f}")
+
+  bounds = {'maia_rank': (0, 40), 'depth_cp': (0, 40), 'penalty': (-2.4, 0)}
+  grid_keys = list(bounds)
+
+  def norm(x, k):
+    lo, hi = bounds[k]
+    return min(max((x[k] - lo) / (hi - lo), 0), 1)
+
+  scored = []
+  for ws in itertools.product(np.arange(0, 1.01, 0.1), repeat=len(grid_keys)):
+    fn = lambda x: sum(w * norm(x, k) for w, k in zip(ws, grid_keys))
+    scored.append((
+      ws,
+      average_precision([fn(x) for x in train['measures']], train['label']),
+      average_precision([fn(x) for x in valid['measures']], valid['label']),
+      average_precision([fn(x) for x in allset['measures']], allset['label']),
+    ))
+  scored.sort(key=lambda r: -r[1])
+
+  wtable = Table(title=f"{' '.join(grid_keys)}", box=rich_box.ASCII)
+  wtable.add_column("Weights")
+  wtable.add_column("Train")
+  wtable.add_column("Test")
+  wtable.add_column("Train+Test")
+  wtable.add_column("F1")
+
+  for ws, tr, va, al in scored[:10] + [r for r in scored if r[0] == (1.0,1.0,1.0)]:
+    fn = lambda x: sum(w * norm(x, k) for w, k in zip(ws, grid_keys))
+    f1 = calc_f1(fn)['valid-f1']
+    wsn = np.array(ws) / sum(ws)
+    wtable.add_row(' '.join(f'{w:.3f}' for w in wsn), f"{tr:.4f}", f"{va:.4f}", f"{al:.4f}", f"{f1:.3f}")
+
+  print(f'corr(train AP, valid AP) = {np.corrcoef([r[1] for r in scored], [r[2] for r in scored])[0, 1]:.3f}')
+  Console().print(wtable)
+
+  # print([x['maia_rank'] for x in train['measures']])
+  # print([x['depth_cp'] for x in train['measures']])
+  # print([x for x in train['label']])
+
+  train = train.sort('label')
+  for x in train:
+    rank = x['measures']['maia_rank']
+    depth = x['measures']['depth_cp']
+    is_unique = '+' if x['measures']['uniqueness'] > 0.5 else '-'
+
+    label = '+' if x['label'] else '-'
+    print(f'[{label}] R{int(rank)} D{int(depth)} U{is_unique} -- {x["FEN"]}')
 
   Console().print(table)
+
+  f1 = calc_f1(lambda x: x['counterint'], selthr=0.1)
+  print(f1)
+  f1 = calc_f1(counterint_three, selthr=0.4)
+  print('0.4', f1)
+  f1 = calc_f1(counterint_three, selthr=0.5)
+  print('0.5', f1)
+  f1 = calc_f1(counterint_three, selthr=0.6)
+  print('0.6', f1)
 
   def plot_measure(k):
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -637,7 +733,6 @@ def test_goldenset():
     plt.show()
 
   plot_measure('maia_rank')
-  plot_measure('maia_rankfrac')
 
 def test_x():
   x = "2b3k1/2r4p/p3pn1r/Pp1p1pK1/3P1Pp1/2PN4/1PB2P2/R6R b - - 0 1"
