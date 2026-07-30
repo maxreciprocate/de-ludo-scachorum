@@ -25,8 +25,8 @@ from dataclasses import asdict, dataclass
 from matplotlib import pyplot as plt
 from blob import pretty_dict
 from types import SimpleNamespace
-# import datasets
-# datasets.disable_caching()
+import datasets
+datasets.disable_caching()
 
 match sys.platform:
   case 'darwin':
@@ -92,14 +92,28 @@ def maia_move_probs(board, elo):
   return out
 
 def maia_measures(board, top_move):
+  out = {}
   fracs, surps, ranks = [], [], []
   for elo in MAIA_ELOS:
     probs = maia_move_probs(board, elo)
-    rank = sum(v > probs[top_move] for v in probs.values())
-    fracs.append(rank / max(len(probs) - 1, 1))
-    surps.append(-math.log(max(probs[top_move], 1e-12)))
-    ranks.append(rank + 1)
-  return float(np.mean(fracs)), float(np.mean(surps)), float(np.mean(ranks))
+    p = probs[top_move]
+    rank = float(sum(v > p for v in probs.values()) + 1)
+    frac = (rank - 1) / max(len(probs) - 1, 1)
+    surp = -math.log(max(p, 1e-12))
+    best = max(probs, key=probs.get)
+    out |= {
+      f"maia_rank_{elo}": rank,
+      f"maia_rankfrac_{elo}": frac,
+      f"maia_surprise_{elo}": surp,
+      f"maia_prob_{elo}": p,
+      f"maia_best_{elo}": best,
+      f"maia_bestprob_{elo}": probs[best],
+      f"maia_entropy_{elo}": -sum(v * math.log(max(v, 1e-12)) for v in probs.values()),
+    }
+    fracs.append(frac)
+    surps.append(surp)
+    ranks.append(rank)
+  return out | {"maia_rankfrac": float(np.mean(fracs)), "maia_surprise": float(np.mean(surps)), "maia_rank": float(np.mean(ranks))}
 
 def win_chances(score: Score) -> float:
   mate = score.mate()
@@ -260,9 +274,12 @@ def reward(fen, **kwargs):
     "penalty": 0.0,
     "uniqueness": 0.0,
     "counterint": 0.0,
+    "counterint_three": 0.0,
     "maia_rankfrac": 0.0,
     "maia_surprise": 0.0,
     "maia_rank": 0.0,
+    **{f"maia_{m}_{elo}": 0.0 for elo in MAIA_ELOS for m in ["rank", "rankfrac", "surprise", "prob", "bestprob", "entropy"]},
+    **{f"maia_best_{elo}": "" for elo in MAIA_ELOS},
     "n_legal_moves": 0.0,
     "nodefrac": 0.0,
     "sf_meganodes": 0.0,
@@ -273,7 +290,9 @@ def reward(fen, **kwargs):
     "pv": "",
     "is_unique": False,
     "is_counterint": False,
+    "is_counterint_three": False,
     "is_puzzle": False,
+    "is_puzzle_three": False,
     "puzzle_distance": None,
     "batch_fen_distance": None,
     "batch_pv_distance": None,
@@ -343,9 +362,7 @@ def reward(fen, **kwargs):
     "uniqueness": x['uniqueness'],
     "counterint": x['counterint'],
     "counterint_three": counterint_three,
-    "maia_rankfrac": x['maia_rankfrac'],
-    "maia_surprise": x['maia_surprise'],
-    "maia_rank": x['maia_rank'],
+    **{k: v for k, v in x.items() if k.startswith('maia_')},
     "n_legal_moves": x['n_legal_moves'],
     "nodefrac": x['nodefrac'],
     "sf_meganodes": x['sf_meganodes'],
@@ -421,7 +438,7 @@ def penalty(x, top_move):
 class Position:
   FEN: str
   measures: dict
-  evaluation: str
+  evaluation: dict
 
 @dataclass
 class Puzzle:
@@ -476,16 +493,14 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
     captured = b.piece_at(chess.Move.from_uci(top_move).to_square)
     capture_material = -PIECE_VALUES.get(captured.piece_type, 0) / 9.0 if captured else 0.0
     cint_og = depth_cp_norm * 0.8 + capture_material * 0.1
-    rankfrac, surprise, rank = maia_measures(b, top_move)
+    maia_out = maia_measures(b, top_move)
 
     measures = {
       "top_move": top_move,
       # "both_mate": both_mate,
       "uniqueness": unq,
       "counterint": cint_og,
-      "maia_rankfrac": rankfrac,
-      "maia_surprise": surprise,
-      "maia_rank": rank,
+      **maia_out,
       "n_legal_moves": b.legal_moves.count(),
       "nodefrac": nodefrac,
       "penalty": pnlt,
@@ -498,8 +513,7 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
       "sf_time": max(xx['time'] for xx in eval['evaluation']),
     }
 
-    # just not storing this, takes too much space, i don't use it, sorry
-    eval.pop('evaluation')
+    eval['evaluation'] = json.dumps(eval['evaluation'])
     positions.append(Position(FEN=b.fen(), measures=measures, evaluation=eval))
 
     if unq < uniqueness_threshold:
@@ -523,9 +537,11 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
 
   unique_positions = [p for p in positions if p.measures["is_unique"]]
   src = unique_positions if unique_positions else positions
+  maia_keys = [f"maia_{m}_{elo}" for elo in MAIA_ELOS for m in ["rank", "rankfrac", "surprise", "prob", "bestprob", "entropy"]]
   if not src:
-    return Puzzle(positions=positions, measures={"uniqueness": 0.0, "counterint": 0.0, "maia_rankfrac": 0.0, "maia_surprise": 0.0, "maia_rank": 0.0, "n_legal_moves": 0.0, "penalty": 0.0, "depth_cp": 0.0, "depth_cp_norm": 0, "capture_material": 0.0, "nodefrac": 0.0, "sf_meganodes": 0.0, "sf_depth": 0, "sf_time": 0.0})
-  measures = {k: float(np.mean([p.measures[k] for p in src])) for k in ["uniqueness", "counterint", "maia_rankfrac", "maia_surprise", "maia_rank", "n_legal_moves", "penalty", "depth_cp", "depth_cp_norm", "capture_material", "nodefrac"]}
+    return Puzzle(positions=positions, measures={"uniqueness": 0.0, "counterint": 0.0, "maia_rankfrac": 0.0, "maia_surprise": 0.0, "maia_rank": 0.0, "n_legal_moves": 0.0, "penalty": 0.0, "depth_cp": 0.0, "depth_cp_norm": 0, "capture_material": 0.0, "nodefrac": 0.0, "sf_meganodes": 0.0, "sf_depth": 0, "sf_time": 0.0} | {k: 0.0 for k in maia_keys} | {f"maia_best_{elo}": "" for elo in MAIA_ELOS})
+  measures = {k: float(np.mean([p.measures[k] for p in src])) for k in ["uniqueness", "counterint", "maia_rankfrac", "maia_surprise", "maia_rank", "n_legal_moves", "penalty", "depth_cp", "depth_cp_norm", "capture_material", "nodefrac"] + maia_keys}
+  measures |= {f"maia_best_{elo}": src[0].measures[f"maia_best_{elo}"] for elo in MAIA_ELOS}
   measures |= {k: max(p.measures[k] for p in positions) for k in ["sf_meganodes", "sf_depth", "sf_time"]}
   return Puzzle(positions=positions, measures=measures)
 
@@ -568,10 +584,10 @@ def test_distance():
   print("min_pv_distance ~ all good")
 
 def test_goldenset():
-  valid = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-valid.jsonl"))
-  train = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-train.jsonl"))
-  # valid = Dataset.from_json(os.path.expanduser("/root/data/opus/goldenset-valid.jsonl"))
-  # train = Dataset.from_json(os.path.expanduser("/root/data/opus/goldenset-train.jsonl"))
+  # valid = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-valid.jsonl"))
+  # train = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-train.jsonl"))
+  valid = Dataset.from_json(os.path.expanduser("/workspace/data/opus/goldenset-valid.jsonl"))
+  train = Dataset.from_json(os.path.expanduser("/workspace/data/opus/goldenset-train.jsonl"))
   valid = valid.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=cpu_count)
   train = train.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=cpu_count)
   allset = concatenate_datasets([train, valid])
