@@ -59,17 +59,20 @@ def decode(tokens):
     board = board.mirror()
   return board
 
-DTYPE = torch.bfloat16
-# from kernels import get_kernel
-# flash_attn_4 = get_kernel("SecondNatureComputing/flash-attn-4-sm120", trust_remote_code=True, version=0)
-
-from kernels import get_kernel
-kernel_module = get_kernel("kernels-community/flash-attn2", version=2)
-flash_attn_func = kernel_module.flash_attn_func
-
-# import sys, importlib
-# sys.path.insert(0, "flash-attn-4-sm120/build/")
-# flash_attn_4 = importlib.import_module("flash_attn_4_sm120")
+match sys.platform:
+  case 'darwin':
+    USE_FA2=False
+    DTYPE = torch.bfloat16
+  case 'linux':
+    USE_FA2=False
+    DTYPE = torch.bfloat16
+    # from kernels import get_kernel
+    # kernel_module = get_kernel("kernels-community/flash-attn2", version=2)
+    # flash_attn_func = kernel_module.flash_attn_func
+    # flash_attn_4 = get_kernel("SecondNatureComputing/flash-attn-4-sm120", trust_remote_code=True, version=0)
+    # import importlib
+    # sys.path.insert(0, "flash-attn-4-sm120/build/")
+    # flash_attn_4 = importlib.import_module("flash_attn_4_sm120")
 
 @dataclass
 class Config:
@@ -104,12 +107,14 @@ class MHA(nn.Module):
 
   def forward(self, x):
     B, T, D = x.shape
-    # q, k, v = (t.view(B, T, self.cfg.heads, D//self.cfg.heads).transpose(1, 2) for t in self.qkv(x).chunk(3, dim=-1))
     q, k, v = (t.view(B, T, self.cfg.heads, D//self.cfg.heads) for t in self.qkv(x).chunk(3, dim=-1))
     q, k = norm(q), norm(k)
-    # y = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2)
-    y = flash_attn_func(q, k, v, causal=True)
+    # q, k, v = (t.view(B, T, self.cfg.heads, D//self.cfg.heads).transpose(1, 2) for t in self.qkv(x).chunk(3, dim=-1))
     # y, _ = flash_attn_4.flash_attn_func(q, k, v, causal=True)
+    if USE_FA2:
+      y = flash_attn_func(q, k, v, causal=True)
+    else:
+      y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True).transpose(1, 2)
     y = y.contiguous().view(B, T, D)
     y = self.o(y)
     return y
