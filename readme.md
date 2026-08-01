@@ -1,8 +1,13 @@
 <img src="./core.jpg" width="800px"></img>
 
-This is reproduction and extention of <a href="https://sites.google.com/view/puzzle-gen/overview">Generating Creative Chess Puzzles (Deepmind 2025)</a>
+WIP
 
-To create puzzles (originally they sampled 1 million, so try your luck with my models):
+This is a reproduction and extention of <a href="https://sites.google.com/view/puzzle-gen/overview">Generating Creative Chess Puzzles (Deepmind 2025)</a>
+
+To create puzzles (originally they sampled 1 million, so try your luck):
+
+> These are old instructions: you'd have to `git checkout ee22c2a56` first
+
 ```bash
 uv sync
 . .venv/bin/activate
