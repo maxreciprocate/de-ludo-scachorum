@@ -1,0 +1,339 @@
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+import json
+import chess
+import torch
+torch.set_num_threads(1)
+import wandb
+import numpy as np
+from tqdm import trange
+from rich.table import Table
+from rich.console import Console
+from rich import box
+from huggingface_hub import hf_hub_download
+from collections import defaultdict
+from copy import deepcopy
+import datasets
+from datasets import Dataset, load_dataset
+from safetensors import safe_open
+from pico import Picoformer, Config, decode, encode
+from safetensors.torch import save_file
+import torch.nn.functional as F
+from reward import reward, cpu_count, is_realistic, getboard
+
+datasets.disable_progress_bars()
+print(f'{cpu_count=}')
+# ;;
+
+console = Console()
+
+def log(d, step=None):
+  stats = ('min', 'avg', 'max', 'std')
+  priority = ("reward", "qualified")
+
+  wandb.log(d, step=step)
+  groups = defaultdict(dict)
+  for k, v in d.items():
+    prefix, _, suffix = k.partition('/')
+    groups[prefix][suffix or None] = v
+
+  def order_key(kv):
+    name = kv[0]
+    return (priority.index(name) if name in priority else len(priority), name)
+
+  t = Table(box=box.ASCII, show_header=True, header_style="bold", title=" ")
+  for col in ("metric", *stats):
+    t.add_column(col)
+
+  def scalar_row(label, v):
+    t.add_row(label, "-", f"{v:.4f}", "-", "-")
+
+  for name, subs in sorted(groups.items(), key=order_key):
+    if any(s in subs for s in stats):
+      t.add_row(name, *(f"{subs[s]:.3f}" if s in subs else "-" for s in stats))
+    elif None in subs:
+      scalar_row(name, subs[None])
+      for sub, v in subs.items():
+        if sub is not None:
+          scalar_row(f"  {sub}", v)
+    else:
+      for sub, v in subs.items():
+        scalar_row(f"{name}/{sub}", v)
+  console.print(t)
+
+configs = {
+  "12M": Config(dim=256,layers=16,heads=4),
+  "192M": Config(dim=1024,layers=16,heads=8)
+}
+cfg = configs["192M"]
+m = Picoformer(cfg)
+state_dict = {}
+
+path = hf_hub_download("reciprocate/chess-puzzle-weaver", filename="model.safetensors")
+with safe_open(path, 'pt') as f:
+  for k in f.keys():
+    state_dict[k] = f.get_tensor(k)
+m.load_state_dict(state_dict)
+m.to(0)
+
+def reward_pawns(fen: str, **kwargs):
+  b = chess.Board(fen)
+  invalid = {"score": -10}
+  if not b.is_valid():
+    return invalid
+  return {"score": -sum(bool(b.piece_at(ix) and chess.PAWN == b.piece_at(ix).piece_type) for ix in range(64))}
+
+def generate(m,n,seed):
+  return m.generate(torch.ones(n,1,dtype=torch.long).to(m.device) * 13, seed=seed, temperature=1.0)
+
+def reward_unq(*args, **kwargs):
+  return reward(*args, **{**kwargs, "select_score": lambda is_unq, is_cnt, is_cnt3: float(is_unq)})
+
+reward_fn = reward
+n_replay = 16
+n_replay_max_used = 1
+batch = 128
+Ngen = batch-n_replay
+alpha = 1
+ent_beta = 0
+kl_beta_final = 1e-2
+max_score = 1
+nmini = 4
+lr = 1e-2
+min_eps = 0.2
+max_eps = 0.3
+ripo = True
+ripo_delta = 0.05
+ripo_r_min = 0.5
+ripo_r_max = 10.0
+tau_ent = 0.6
+save_every = 100
+max_steps = 90
+debug_every = 5
+# runname="uses1_sf18_jul30_warmup_kldecay"
+runname=f"ripo_{nmini}_jul31"
+
+# reward_fn = reward_pawns
+# Ngen = 64
+# alpha = 1
+# tau_ent = 0
+# ent_beta = 0
+# kl_beta_final = 0
+# max_score = 0
+# min_eps = 0.2
+# max_eps = 0.3
+# nmini = 1
+# lr = 1e-2
+# n_replay = 0
+# n_replay_max_used = 0
+# max_steps = 100
+# save_every = float('inf')
+# debug_every = 10
+# runname=""
+
+run_name = f"{reward_fn.__name__}_N{Ngen}_a{alpha:g}_kl{kl_beta_final:g}_ent{ent_beta:g}_{runname}"
+wandb.init(project="opus-rein", name=run_name, config={
+  "Ngen": Ngen, "alpha": alpha,
+  "ent_beta": ent_beta, "kl_beta_final": kl_beta_final, "max_score": max_score,
+  "min_eps": min_eps, "max_eps": max_eps,
+  "ripo": ripo, "ripo_delta": ripo_delta, "ripo_r_min": ripo_r_min, "ripo_r_max": ripo_r_max,
+  "nmini": nmini, "reward_fn": reward_fn.__name__,
+})
+
+m_ref = deepcopy(m)
+opt = m.init_opt(muon_lr=lr, embd_lr=2e-3, head_lr=3e-4)
+
+# reviewed_puzzles = load_dataset("reciprocate/counterint-4MN-500000", split="train")
+reviewed_puzzles = load_dataset("reciprocate/counterint-1MN-maia-100K-jul26", split="train")
+good_puzzles = reviewed_puzzles.filter(lambda x: x['is_puzzle_three'])
+print(f'{good_puzzles=}')
+print(f'{np.mean(good_puzzles['n_pieces'])=}')
+# good_puzzles = Dataset.from_json("good_puzzles/counterint-1MN-500.json")
+# good_puzzles = good_puzzles.map(lambda x: {"fen": getboard(x).fen()})
+
+replay_buffer = [{'ix': ix, 'fen': x['FEN'], 'used': 0, 'source': 'lichess'} for ix, x in enumerate(good_puzzles)]
+rng = np.random.RandomState(0)
+
+def save_debug(stepix, fens, sources, measures, rewards, advantages, states, logprobs, logprobs_taken, logprobs_taken_ref, logratio, ratio):
+  logprobs = logprobs.detach().float().cpu()
+  lp = logprobs_taken.detach().float().cpu()
+  lp_ref = logprobs_taken_ref.float().cpu()
+  logratio = logratio.detach().float().cpu()
+  ratio = ratio.detach().float().cpu()
+  taken = states[:, 1:].cpu()
+  kl = logratio
+  entropy = (-logprobs.exp() * logprobs).sum(-1)
+  probs = logprobs.exp()
+  rewards = rewards.float().cpu()
+  advantages = advantages.squeeze(-1).float().cpu()
+  r = lambda x: round(x, 6)
+  records = []
+  for ix in range(len(fens)):
+    tokens = []
+    for t in range(taken.shape[1]):
+      tokens.append({
+        "id": taken[ix, t].item(),
+        "logprob": r(lp[ix, t].item()),
+        "logprob_ref": r(lp_ref[ix, t].item()),
+        "kl": r(kl[ix, t].item()),
+        "entropy": r(entropy[ix, t].item()),
+        "ratio": r(ratio[ix, t].item()),
+        "probs": [r(p) for p in probs[ix, t].tolist()],
+      })
+    records.append({
+      "step": stepix, "ix": ix, "fen": fens[ix], "source": sources[ix],
+      **(measures[ix] if ix < len(measures) else {}),
+      "reward": r(rewards[ix].item()), "advantage": r(advantages[ix].item()),
+      "logprob_sum": r(lp[ix].sum().item()), "kl_mean": r(kl[ix].mean().item()),
+      "entropy_mean": r(entropy[ix].mean().item()),
+      "tokens": tokens,
+    })
+  os.makedirs(f"out/debug/{run_name}", exist_ok=True)
+  with open(f"out/debug/{run_name}/step_{stepix:04d}.json", 'w') as f:
+    json.dump(records, f)
+
+for stepix in trange(max_steps):
+  token_ids = generate(m,n=Ngen,seed=stepix)
+
+  bs = [decode(x) for x in token_ids]
+  is_valid = sum([b.is_valid() for b in bs]) / len(bs)
+
+  if is_valid < 0.5:
+    console.print("[yellow]valid collapse[/yellow]")
+    break
+
+  fens = [decode(x).fen() for x in token_ids]
+  sources = ['sampled'] * len(fens)
+  fens_ds = Dataset.from_dict({'fens': fens})
+
+  rewards_dict = fens_ds.map(reward_fn, input_columns=['fens'], num_proc=cpu_count)
+  rewards_original = list(rewards_dict['score'])
+  rewards = deepcopy(rewards_original)
+  rewards_original = torch.tensor(rewards_original, dtype=torch.float)
+  qualified = (rewards_original >= max_score).float().mean().item()
+
+  with torch.no_grad():
+    lp = F.log_softmax(m(token_ids)[:, :-1, :], dim=-1)
+    seq_ent = (-lp.exp() * lp).sum(-1).mean(-1)
+  for ix in range(len(rewards)):
+    if rewards[ix] == max_score and seq_ent[ix] < tau_ent:
+      rewards[ix] = 0.0
+
+  # this is just to not sample twice
+  n_replay_buffer = len(replay_buffer)
+  for r, fen in zip(rewards, fens):
+    if r == max_score:
+      replay_buffer.append({"ix": len(replay_buffer), "fen": fen, "source": "sampled", "used": 1})
+
+  if n_replay:
+    replay_buffer_active = [x for x in replay_buffer[:n_replay_buffer] if x['used'] < n_replay_max_used]
+    replay_ixs = rng.choice(len(replay_buffer_active), size=min(n_replay, len(replay_buffer_active)), replace=False)
+    for ix in replay_ixs:
+      x = replay_buffer_active[ix]
+      fens.append(x['fen'])
+      sources.append('replay:' + x['source'])
+      rewards.append(1.0)
+      replay_buffer[x['ix']]['used'] += 1
+    token_ids = torch.stack([encode(chess.Board(fen)) for fen in fens]).to(m.device)
+
+  states = token_ids.clone()
+  rewards = torch.tensor(rewards, dtype=torch.float, device=m.device)
+
+  with torch.no_grad():
+    logprobs_old = F.log_softmax(m(states)[:, :-1, :], dim=-1)
+    logprobs_ref = F.log_softmax(m_ref(states)[:, :-1, :], dim=-1)
+    logprobs_taken_old = torch.gather(logprobs_old, dim=-1, index=states[:, 1:, None]).squeeze(-1)
+    logprobs_taken_ref = torch.gather(logprobs_ref, dim=-1, index=states[:, 1:, None]).squeeze(-1)
+
+  advantages = (rewards - rewards.mean()) * len(rewards) / (len(rewards) - 1) / (rewards.std() + 1e-24)
+  advantages = advantages.unsqueeze(-1)
+
+  for ministepix in range(nmini):
+    logits = m(states)[:, :-1, :]
+    logprobs = F.log_softmax(logits, dim=-1)
+    logprobs_taken = torch.gather(logprobs, dim=-1, index=states[:, 1:, None]).squeeze(-1)
+
+    logratio = logprobs_taken - logprobs_taken_old
+    ratio = torch.exp(logratio)
+    ratio_mask = ((ratio >= 1-min_eps) | (ratio <= 1+max_eps))
+
+    if ripo:
+      pi_old = torch.exp(logprobs_taken_old).clamp_min(1e-8)
+      ripo_eps = torch.sqrt(ripo_delta / pi_old)
+      lo = (1.0 - ripo_eps).clamp(min=ripo_r_min)
+      hi = (1.0 + ripo_eps).clamp(max=ripo_r_max)
+      ratio_clip = torch.clamp(ratio, lo, hi)
+    else:
+      ratio_clip = torch.clip(ratio, min=1-min_eps, max=1+max_eps)
+
+    policy_loss = -torch.min(ratio * advantages, ratio_clip * advantages) * ratio_mask
+    policy_loss = policy_loss.sum() / ratio_mask.sum()
+
+    print(f'{logprobs.shape=}')
+    print(f'{ratio_mask.shape=}')
+    entropy = (-logprobs.exp() * logprobs).sum(-1)
+    entropy_loss = -ent_beta * (entropy * ratio_mask).sum() / ratio_mask.sum()
+    entropy_mean = entropy.mean()
+
+    logratio_taken_ref = logprobs_taken_ref - logprobs_taken
+    kl = (ratio * (torch.exp(logratio_taken_ref) - 1 - logratio_taken_ref))
+    kl = (kl * ratio_mask).sum() / ratio_mask.sum()
+    # kl_beta = 1 + (kl_beta_final - 1) * stepix / max_steps
+    kl_beta = kl_beta_final
+    kl_loss = kl_beta * kl
+
+    with torch.no_grad():
+      kl_est = (torch.exp(logratio) - 1 - logratio).mean()
+      clipfrac = ((ratio < 1-min_eps) | (ratio > 1+max_eps)).float().mean()
+
+    loss = alpha * (policy_loss + entropy_loss + kl_loss)
+    loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+    lr_mult = min(1.0, stepix / 10)
+    opt.set_lr_mult(lr_mult)
+    opt.step()
+    opt.zero_grad()
+
+    rewards = rewards.cpu()
+    entropy_mean = entropy_mean.cpu()
+    advantages_cpu = advantages.cpu()
+    logprobs_taken_cpu = logprobs_taken.cpu()
+
+    if ministepix == nmini -1:
+      measure_stats = {}
+      for k in rewards_dict.column_names:
+        if k in ('fens', 'puzzle', 'score') or k.endswith('00'):
+          continue
+        vals = [v for v in rewards_dict[k] if v is not None and isinstance(v, float) or isinstance(v, int)or isinstance(v, bool)]
+        if vals:
+          vt = torch.tensor(vals, dtype=torch.float)
+          measure_stats.update({f"{k}/min": vt.min().item(), f"{k}/avg": vt.mean().item(), f"{k}/max": vt.max().item(), f"{k}/std": vt.std().item()})
+      log({
+        "loss": loss.item(), "loss/policy": policy_loss.item(), "loss/entropy": entropy_loss.item(),
+        "kl": kl.item(), "loss/kl": kl_loss.item(),
+        "ratio": ratio.cpu().mean().item(), "kl_est": kl_est.cpu().item(), "clipfrac": clipfrac.cpu().item(), "kl_beta": kl_beta, "lr": lr * lr_mult,
+        "grad_norm": grad_norm.item(),
+        "reward/min": rewards.min().item(), "reward/avg": rewards.mean().item(), "reward/max": rewards.max().item(), "reward/std": rewards.std().item(),
+        "reward_original/min": rewards_original.min().item(), "reward_original/avg": rewards_original.mean().item(), "reward_original/max": rewards_original.max().item(), "reward_original/std": rewards_original.std().item(),
+        "advantage/min": advantages_cpu.min().item(), "advantage/avg": advantages_cpu.mean().item(), "advantage/max": advantages_cpu.max().item(), "advantage/std": advantages_cpu.std().item(),
+        "logprob/min": logprobs_taken_cpu.min().item(), "logprob/avg": logprobs_taken_cpu.mean().item(), "logprob/max": logprobs_taken_cpu.max().item(), "logprob/std": logprobs_taken_cpu.std().item(),
+        "entropy": entropy_mean.item(),
+        "valid": is_valid,
+        "qualified": qualified,
+        **measure_stats,
+      }, step=stepix)
+
+      if stepix % debug_every == 0:
+        measure_keys = [k for k in rewards_dict.column_names if k not in ('fens', 'puzzle')]
+        measures = [{k: rewards_dict[k][i] for k in measure_keys} for i in range(len(rewards_dict))]
+        save_debug(stepix, fens, sources, measures, rewards, advantages, states, logprobs, logprobs_taken, logprobs_taken_ref, logprobs_taken - logprobs_taken_ref, ratio)
+
+  if stepix > 0 and stepix % save_every == 0:
+    os.makedirs(f"ckpts/{run_name}", exist_ok=True)
+    save_file(m.state_dict(), f"ckpts/{run_name}/model_{stepix}.safetensors")
+
+os.makedirs(f"ckpts/{run_name}", exist_ok=True)
+save_file(m.state_dict(), f"ckpts/{run_name}/model.safetensors")
+wandb.finish()
+
