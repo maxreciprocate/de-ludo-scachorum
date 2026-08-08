@@ -3,6 +3,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 import sys
 import os
+import threading
 import torch
 import fcntl
 import math
@@ -57,10 +58,22 @@ if (cpu_count := os.environ.get("CPU_COUNT")) is None:
 else:
   cpu_count = int(cpu_count)
 
-stockfishcfg = {"Threads": 1, "Hash": 1024}
+stockfishcfg = {"Threads": 1, "Hash": 32}
 stockfish_meganodes = int(os.environ.get("MEGANODES", 1))
 stockfish_maxdepth = 40
 stockfish_limit = chess.engine.Limit(nodes=stockfish_meganodes * 1_000_000, time=40, depth=stockfish_maxdepth)
+
+sf = None
+sf_pid = None
+
+def get_engine():
+  global sf, sf_pid
+  if sf is None or sf_pid != os.getpid():
+    sf = chess.engine.SimpleEngine.popen_uci(stockfishpath, timeout=60)
+    sf.configure(stockfishcfg)
+    sf_pid = os.getpid()
+    threading._register_atexit(sf.close)
+  return sf
 
 MAIA_ELOS = [1100, 1500, 1900, 2300, 2700]
 MAIA_MODEL = "maia3-79m"
@@ -210,39 +223,38 @@ def evaluate(x):
   if not x.get("legal", True):
     return {"evaluation": None, "top": None, "second": None, "max_depth": 0}
 
-  with chess.engine.SimpleEngine.popen_uci(stockfishpath) as engine:
-    engine.configure(stockfishcfg)
-    b = x if isinstance(x, chess.Board) else getboard(x)
+  engine = get_engine()
+  b = x if isinstance(x, chess.Board) else getboard(x)
 
-    evaluation = []
-    with engine.analysis(b, info=chess.engine.INFO_ALL, limit=stockfish_limit, multipv=2) as analysis:
-      for info in analysis:
-        if 'score' in info and 'pv' in info and len(info['pv']) > 0:
-          score = info['score'].pov(b.turn)
-          evaluation.append({
-            "depth": info['depth'],
-            "multipv": info['multipv'],
-            "nodes": info['nodes'],
-            "time": info['time'],
-            "score": {"moves": score.__dict__.get("moves", 1000), "cp": score.__dict__.get("cp", 0)},
-            "winprob": win_chances(score),
-            "move": info['pv'][0].uci(),
-            "pv": [m.uci() for m in info['pv']],
-            "mnps": info['nps'] / 1e6
-          })
+  evaluation = []
+  with engine.analysis(b, info=chess.engine.INFO_ALL, limit=stockfish_limit, multipv=2) as analysis:
+    for info in analysis:
+      if 'score' in info and 'pv' in info and len(info['pv']) > 0:
+        score = info['score'].pov(b.turn)
+        evaluation.append({
+          "depth": info['depth'],
+          "multipv": info['multipv'],
+          "nodes": info['nodes'],
+          "time": info['time'],
+          "score": {"moves": score.__dict__.get("moves", 1000), "cp": score.__dict__.get("cp", 0)},
+          "winprob": win_chances(score),
+          "move": info['pv'][0].uci(),
+          "pv": [m.uci() for m in info['pv']],
+          "mnps": info['nps'] / 1e6
+        })
 
-      if not evaluation:
-        return {"legal": False, "evaluation": [], "top": None, "second": None, "max_depth": 0}
-      max_depth = max(xx['depth'] for xx in evaluation)
-      top = next(xx for xx in evaluation if xx['depth'] == max_depth and xx['multipv'] == 1)
+    if not evaluation:
+      return {"legal": False, "evaluation": [], "top": None, "second": None, "max_depth": 0}
+    max_depth = max(xx['depth'] for xx in evaluation)
+    top = next(xx for xx in evaluation if xx['depth'] == max_depth and xx['multipv'] == 1)
+    try:
+      second = next(xx for xx in evaluation if xx['depth'] == max_depth and xx['multipv'] == 2)
+    except StopIteration:
+      top = next(xx for xx in evaluation if xx['depth'] == max_depth-1 and xx['multipv'] == 1)
       try:
-        second = next(xx for xx in evaluation if xx['depth'] == max_depth and xx['multipv'] == 2)
+        second = next(xx for xx in evaluation if xx['depth'] == max_depth-1 and xx['multipv'] == 2)
       except StopIteration:
-        top = next(xx for xx in evaluation if xx['depth'] == max_depth-1 and xx['multipv'] == 1)
-        try:
-          second = next(xx for xx in evaluation if xx['depth'] == max_depth-1 and xx['multipv'] == 2)
-        except StopIteration:
-          second = None
+        second = None
 
   return {"evaluation": evaluation, "top": top, "second": second, "max_depth": max_depth}
 
@@ -456,15 +468,13 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
       break
 
     if eval['second'] and 0 < eval['top']['score'].get('moves', np.inf) <= 15 and 0 < eval['second']['score'].get('moves', np.inf) <= 15:
-      with chess.engine.SimpleEngine.popen_uci(stockfishpath) as engine:
-        engine.configure(stockfishcfg)
-        info = engine.analyse(b, limit=stockfish_limit, multipv=32)
-        scores = [pv["score"].pov(b.turn) for pv in info]
-        nmates = sum([s >= Mate(15) for s in scores])
-        if nmates >= len(scores):
-          unq = 2.0
-        else:
-          unq = 1.0 - win_chances(scores[nmates])
+      info = get_engine().analyse(b, limit=stockfish_limit, multipv=32)
+      scores = [pv["score"].pov(b.turn) for pv in info]
+      nmates = sum([s >= Mate(15) for s in scores])
+      if nmates >= len(scores):
+        unq = 2.0
+      else:
+        unq = 1.0 - win_chances(scores[nmates])
 
     # m_top = eval['top']['score'].get('moves', 1000)
     # m_second = eval['second']['score'].get('moves', 1000) if eval['second'] else 1000
@@ -527,10 +537,8 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
     if len(eval['top']['pv']) > 1:
       b.push_uci(eval['top']['pv'][1])
     else:
-      with chess.engine.SimpleEngine.popen_uci(stockfishpath) as engine:
-        engine.configure(stockfishcfg)
-        opmove = engine.play(b, limit=stockfish_limit).move.uci()
-        b.push_uci(opmove)
+      opmove = get_engine().play(b, limit=stockfish_limit).move.uci()
+      b.push_uci(opmove)
 
     if b.is_game_over():
       break
@@ -584,10 +592,10 @@ def test_distance():
   print("min_pv_distance ~ all good")
 
 def test_goldenset():
-  # valid = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-valid.jsonl"))
-  # train = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-train.jsonl"))
-  valid = Dataset.from_json(os.path.expanduser("/workspace/data/opus/goldenset-valid.jsonl"))
-  train = Dataset.from_json(os.path.expanduser("/workspace/data/opus/goldenset-train.jsonl"))
+  valid = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-valid.jsonl"))
+  train = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-train.jsonl"))
+  # valid = Dataset.from_json(os.path.expanduser("/workspace/data/opus/goldenset-valid.jsonl"))
+  # train = Dataset.from_json(os.path.expanduser("/workspace/data/opus/goldenset-train.jsonl"))
   valid = valid.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=cpu_count)
   train = train.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=cpu_count)
   allset = concatenate_datasets([train, valid])
@@ -749,6 +757,7 @@ def test_goldenset():
     plt.show()
 
   plot_measure('maia_rank')
+  allset.to_json('out/goldenset.json')
 
 def test_x():
   x = "2b3k1/2r4p/p3pn1r/Pp1p1pK1/3P1Pp1/2PN4/1PB2P2/R6R b - - 0 1"
