@@ -1,6 +1,8 @@
 import argparse
 import math
 import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import numpy as np
 import torch
@@ -12,6 +14,7 @@ from rich.table import Table
 from rich.console import Console
 from rich import box as rich_box
 from tqdm import tqdm
+from blob import pretty_int, pretty_date
 
 from pico import Config, Picoformer, decode
 from reward import reward, cpu_count, getboard, stockfish_meganodes, stockfish_maxdepth
@@ -19,8 +22,8 @@ from reward import reward, cpu_count, getboard, stockfish_meganodes, stockfish_m
 if __name__ == '__main__':
   parser = argparse.ArgumentParser()
   parser.add_argument("path", type=str)
-  parser.add_argument("--model", default="12M", choices=["12M", "192M"])
-  parser.add_argument("--n", type=int, default=2000)
+  parser.add_argument("--model", default="192M", choices=["12M", "192M"])
+  parser.add_argument("--n", type=int, default=10_000)
   parser.add_argument("--batch_size", type=int, default=1000)
   parser.add_argument("--temperature", type=float, default=1.0)
   args = parser.parse_args()
@@ -64,7 +67,7 @@ if __name__ == '__main__':
   xs = xs.map(lambda x: {**reward(x['fen'])}, num_proc=cpu_count)
 
   os.makedirs("artifacts", exist_ok=True)
-  outpath = f"artifacts/{os.path.basename(args.path.rstrip('/'))}-{len(xs)}n-eval.json"
+  outpath = f"artifacts/eval_{args.path.rstrip('/').replace('/', '_')}-{pretty_int(len(xs))}-{pretty_date()}.json"
   xs.to_json(outpath)
 
   legal = xs.filter(lambda x: x['legal'])
@@ -75,7 +78,9 @@ if __name__ == '__main__':
   table.add_row("is_legal", f"{np.mean(xs['legal']):.4f}")
   table.add_row("is_unq", f"{np.mean(xs['is_unique']):.4f}")
   table.add_row("is_cnt", f"{np.mean(xs['is_counterint']):.4f}")
+  table.add_row("is_cnt3", f"{np.mean(xs['is_counterint_three']):.4f}")
   table.add_row("is_puzzle", f"{np.mean(xs['is_puzzle']):.4f}")
+  table.add_row("is_puzzle3", f"{np.mean(xs['is_puzzle_three']):.4f}")
   table.add_row("counterint", f"{np.mean(legal['counterint']):.4f}")
   table.add_row("uniqueness", f"{np.mean(legal['uniqueness']):.4f}")
   table.add_row("pieces", f"{np.mean(xs['n_pieces']):.4f}")
@@ -85,14 +90,16 @@ if __name__ == '__main__':
 
   print(outpath)
 
-  cols = ["model", "score", "is_legal", "is_unq", "is_cnt", "is_puzzle", "counterint", "uniqueness"]
+  cols = ["model", "score", "is_legal", "is_unq", "is_cnt", "is_cnt3", "is_puzzle", "is_puzzle3", "counterint", "uniqueness"]
   vals = [
     args.path,
     f"{np.mean(xs['score']):.4f}",
     f"{np.mean(xs['legal']):.4f}",
     f"{np.mean(xs['is_unique']):.4f}",
     f"{np.mean(xs['is_counterint']):.4f}",
+    f"{np.mean(xs['is_counterint_three']):.4f}",
     f"{np.mean(xs['is_puzzle']):.4f}",
+    f"{np.mean(xs['is_puzzle_three']):.4f}",
     f"{np.mean(legal['counterint']):.4f}",
     f"{np.mean(legal['uniqueness']):.4f}",
   ]
