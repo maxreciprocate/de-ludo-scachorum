@@ -60,8 +60,8 @@ else:
 
 stockfishcfg = {"Threads": 1, "Hash": 32}
 stockfish_meganodes = int(os.environ.get("MEGANODES", 1))
-stockfish_maxdepth = 40
-stockfish_limit = chess.engine.Limit(nodes=stockfish_meganodes * 1_000_000, time=40, depth=stockfish_maxdepth)
+stockfish_maxdepth = 50
+stockfish_limit = chess.engine.Limit(nodes=stockfish_meganodes * 1_000_000, time=120, depth=stockfish_maxdepth)
 
 sf = None
 sf_pid = None
@@ -81,7 +81,9 @@ MAIA_MODEL = "maia3-79m"
 sys.path.append('maia3')
 from maia3.uci import load_model
 from maia3.model_registry import resolve_model_spec, resolve_checkpoint_path
-from maia3.utils import get_all_possible_moves
+from maia3.utils import get_all_possible_moves, mirror_move
+from maia3.dataset import tokenize_board, get_historical_tokens, get_legal_moves_mask
+from collections import deque
 spec = resolve_model_spec(MAIA_MODEL)
 path = resolve_checkpoint_path(spec)
 cfg = SimpleNamespace(**spec.config, device='cpu', checkpoint_path=path)
@@ -90,9 +92,6 @@ maia = SimpleNamespace(model=load_model(cfg), cfg=cfg, ucis=ucis, move_idx={m: i
 
 @torch.no_grad()
 def maia_move_probs(board, elo):
-  from collections import deque
-  from maia3.dataset import tokenize_board, get_historical_tokens, get_legal_moves_mask
-  from maia3.utils import mirror_move
   tokens = get_historical_tokens(deque([tokenize_board(board)]), maia.cfg, 0.0, 0.0, 0.0, 0.0).unsqueeze(0)
   elos = torch.tensor([elo], dtype=torch.long)
   logits, _, _ = maia.model(tokens, elos, elos)
@@ -182,7 +181,7 @@ if os.path.exists(QUALIFIED_SAMPLES_PATH):
   except Exception:
     pass
 
-def read_scored_samples() -> list[dict]:
+def read_scored_samples():
   if not os.path.exists(QUALIFIED_SAMPLES_PATH):
     return []
   with open(QUALIFIED_SAMPLES_PATH, "r") as f:
@@ -191,19 +190,19 @@ def read_scored_samples() -> list[dict]:
     fcntl.flock(f, fcntl.LOCK_UN)
   return samples
 
-def append_scored_sample(sample: dict):
+def append_scored_sample(sample):
   import json
   with open(QUALIFIED_SAMPLES_PATH, "a") as f:
     fcntl.flock(f, fcntl.LOCK_EX)
     f.write(json.dumps(sample) + "\n")
     fcntl.flock(f, fcntl.LOCK_UN)
 
-def min_pv_distance(pv: str, ref_pvs: list[str]) -> float | None:
+def min_pv_distance(pv, ref_pvs):
   if not ref_pvs:
     return None
   return min(Levenshtein.distance(pv, r) / max(len(pv), len(r)) for r in ref_pvs)
 
-def min_fen_distance(expanded_fen: str, ref_fens: list[str] = None) -> int:
+def min_fen_distance(expanded_fen, ref_fens=None):
   if ref_fens is None:
     ref_fens = load_ref_fens()
   if len(ref_fens) == 0:
@@ -219,7 +218,7 @@ PIECE_VALUES = {
   chess.KING: 0,
 }
 
-def evaluate(x):
+def evaluate(x, limit):
   if not x.get("legal", True):
     return {"evaluation": None, "top": None, "second": None, "max_depth": 0}
 
@@ -227,7 +226,7 @@ def evaluate(x):
   b = x if isinstance(x, chess.Board) else getboard(x)
 
   evaluation = []
-  with engine.analysis(b, info=chess.engine.INFO_ALL, limit=stockfish_limit, multipv=2) as analysis:
+  with engine.analysis(b, info=chess.engine.INFO_ALL, limit=limit, multipv=2) as analysis:
     for info in analysis:
       if 'score' in info and 'pv' in info and len(info['pv']) > 0:
         score = info['score'].pov(b.turn)
@@ -268,7 +267,7 @@ def is_realistic(board: chess.Board) -> bool:
   return True
 
 def reward(fen, **kwargs):
-  tau_unq, tau_cnt, tau_three = 0.5, 0.1, 0.4
+  tau_unq, tau_cnt, tau_three = 0.5, 0.1, 0.15
   fen_distance_threshold = 6
   pv_distance_threshold = 0.3
 
@@ -323,7 +322,7 @@ def reward(fen, **kwargs):
 
     expanded_fen = expand_fen(fen)
     puzzle_distance = min_fen_distance(expanded_fen)
-    puzzle = fen_to_puzzle(fen)
+    puzzle = fen_to_puzzle(fen, limit=kwargs.get('limit', stockfish_limit))
 
     if len(puzzle.positions) == 0:
       print(f"no positions: {fen}")
@@ -336,7 +335,7 @@ def reward(fen, **kwargs):
 
   x = puzzle.measures
   # these are just normalized to 1 via grid search with step 0.1
-  counterint_three = 0.333 * min(1, max(0, x['maia_rank']) / 40) + 0.333 * min(1, max(0, x['depth_cp']) / 40) + 0.333 * min(1, max(0, (x['penalty']+2.4)/2.4))
+  counterint_three = 0.333 * min(1, max(0, x['maia_rank']) / 40) + 0.333 * min(1, max(0, x['depth_cp']) / 40) + 0.1 * min(1, max(0, (x['penalty']+2.4)/2.4))
 
   is_counterint = x['counterint'] >= tau_cnt
   is_counterint_three = counterint_three >= tau_three
@@ -457,22 +456,26 @@ class Puzzle:
   positions: list[Position]
   measures: dict
 
-def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
+def fen_to_puzzle(fen: str, uniqueness_threshold=0.5, limit=None) -> Puzzle:
+  if limit is None:
+    limit = stockfish_limit
   b = chess.Board(fen)
   positions = []
 
   while not b.is_game_over():
-    eval = evaluate({"FEN": b.fen()})
+    eval = evaluate({"FEN": b.fen()}, limit=limit)
     if eval['top'] is None:
       print(f"eval.top == None -> {b.fen()}")
       break
 
-    if eval['second'] and 0 < eval['top']['score'].get('moves', np.inf) <= 15 and 0 < eval['second']['score'].get('moves', np.inf) <= 15:
-      info = get_engine().analyse(b, limit=stockfish_limit, multipv=32)
+    # this is very bad, yet inverse is much worse
+    if eval['second'] and 0 < eval['top']['score'].get('moves', np.inf) <= 5 and 0 < eval['second']['score'].get('moves', np.inf) <= 5:
+      info = get_engine().analyse(b, limit=limit, multipv=8)
       scores = [pv["score"].pov(b.turn) for pv in info]
-      nmates = sum([s >= Mate(15) for s in scores])
+      nmates = sum([s >= Mate(5) for s in scores])
       if nmates >= len(scores):
-        unq = 2.0
+        # this used to be 2.0 which is maybe more correct, but on some positions it's terrible
+        unq = 0.0
       else:
         unq = 1.0 - win_chances(scores[nmates])
 
@@ -537,7 +540,7 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
     if len(eval['top']['pv']) > 1:
       b.push_uci(eval['top']['pv'][1])
     else:
-      opmove = get_engine().play(b, limit=stockfish_limit).move.uci()
+      opmove = get_engine().play(b, limit=limit).move.uci()
       b.push_uci(opmove)
 
     if b.is_game_over():
@@ -548,8 +551,9 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5) -> Puzzle:
   maia_keys = [f"maia_{m}_{elo}" for elo in MAIA_ELOS for m in ["rank", "rankfrac", "surprise", "prob", "bestprob", "entropy"]]
   if not src:
     return Puzzle(positions=positions, measures={"uniqueness": 0.0, "counterint": 0.0, "maia_rankfrac": 0.0, "maia_surprise": 0.0, "maia_rank": 0.0, "n_legal_moves": 0.0, "penalty": 0.0, "depth_cp": 0.0, "depth_cp_norm": 0, "capture_material": 0.0, "nodefrac": 0.0, "sf_meganodes": 0.0, "sf_depth": 0, "sf_time": 0.0} | {k: 0.0 for k in maia_keys} | {f"maia_best_{elo}": "" for elo in MAIA_ELOS})
-  measures = {k: float(np.mean([p.measures[k] for p in src])) for k in ["uniqueness", "counterint", "maia_rankfrac", "maia_surprise", "maia_rank", "n_legal_moves", "penalty", "depth_cp", "depth_cp_norm", "capture_material", "nodefrac"] + maia_keys}
-  measures |= {f"maia_best_{elo}": src[0].measures[f"maia_best_{elo}"] for elo in MAIA_ELOS}
+  measures = {"uniqueness": float(np.mean([p.measures["uniqueness"] for p in src]))}
+  measures |= {k: float(positions[0].measures[k]) for k in ["counterint", "maia_rankfrac", "maia_surprise", "maia_rank", "n_legal_moves", "penalty", "depth_cp", "depth_cp_norm", "capture_material", "nodefrac"] + maia_keys}
+  measures |= {f"maia_best_{elo}": positions[0].measures[f"maia_best_{elo}"] for elo in MAIA_ELOS}
   measures |= {k: max(p.measures[k] for p in positions) for k in ["sf_meganodes", "sf_depth", "sf_time"]}
   return Puzzle(positions=positions, measures=measures)
 
@@ -592,8 +596,8 @@ def test_distance():
   print("min_pv_distance ~ all good")
 
 def test_goldenset():
-  valid = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-valid.jsonl"))
-  train = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-train.jsonl"))
+  valid = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-valid.jsonl")).shuffle(0)
+  train = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-train.jsonl")).shuffle(0)
   # valid = Dataset.from_json(os.path.expanduser("/workspace/data/opus/goldenset-valid.jsonl"))
   # train = Dataset.from_json(os.path.expanduser("/workspace/data/opus/goldenset-train.jsonl"))
   valid = valid.map(lambda x: asdict(fen_to_puzzle(x["FEN"])), num_proc=cpu_count)
@@ -601,7 +605,7 @@ def test_goldenset():
   allset = concatenate_datasets([train, valid])
 
   # these are just normalized to 1 via grid search with step 0.1
-  counterint_three = lambda x: 0.333 * min(1, max(0, x['maia_rank']) / 40) + 0.333 * min(1, max(0, x['depth_cp']) / 40) + 0.333 * min(1, max(0, (x['penalty']+2.4)/2.4))
+  counterint_three = lambda x: 0.333 * min(1, max(0, x['maia_rank']) / 40) + 0.333 * min(1, max(0, x['depth_cp']) / 40) + 0.1 * min(1, max(0, (x['penalty']+2.4)/2.4))
 
   measures = [
     ('joint', counterint_three),
@@ -770,5 +774,12 @@ if __name__ == '__main__':
   test_goldenset()
   # test_x()
   # test_distance()
+
+  # these had extra positions
+  # fen = "7Q/8/8/5K2/2k5/8/8/q7 w - - 1 2"
+  # fen = "r6R/4kP2/6P1/3p2K1/3Pp3/4P3/5r2/8 w - - 0 1"
+  # x = reward(fen)
+  # print(f'{x['n_unique_positions']=}')
+
   # x = fen_to_puzzle("8/8/6k1/4q1P1/8/5K2/8/8 b - - 3 3")
   # x.positions[0]
