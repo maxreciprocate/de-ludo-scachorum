@@ -267,7 +267,7 @@ def is_realistic(board: chess.Board) -> bool:
   return True
 
 def reward(fen, **kwargs):
-  tau_unq, tau_cnt, tau_three = 0.5, 0.1, 0.15
+  tau_unq, tau_cnt, tau_three = 0.5, 0.1, 0.2
   fen_distance_threshold = 6
   pv_distance_threshold = 0.3
 
