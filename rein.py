@@ -97,22 +97,17 @@ batch = 128
 Ngen = batch-n_replay
 alpha = 1
 ent_beta = 0
-kl_beta_final = 1e-2
+kl_beta_final = 1e-3
 max_score = 1
-nmini = 4
-lr = 1e-2
+nmini = 1
+lr = 1e-3
 min_eps = 0.2
 max_eps = 0.3
-ripo = True
-ripo_delta = 0.05
-ripo_r_min = 0.5
-ripo_r_max = 10.0
 tau_ent = 0.6
-save_every = 100
-max_steps = 90
-debug_every = 5
-# runname="uses1_sf18_jul30_warmup_kldecay"
-runname=f"ripo_{nmini}_jul31"
+max_steps = 877
+save_every = max_steps // 10
+debug_every = 10
+runname="uses1_cnt3"
 
 # reward_fn = reward_pawns
 # Ngen = 64
@@ -132,27 +127,23 @@ runname=f"ripo_{nmini}_jul31"
 # debug_every = 10
 # runname=""
 
-run_name = f"{reward_fn.__name__}_N{Ngen}_a{alpha:g}_kl{kl_beta_final:g}_ent{ent_beta:g}_{runname}"
+run_name = f"{reward_fn.__name__}_N{Ngen}_a{alpha:g}_kl{kl_beta_final:g}_ent{ent_beta:g}_lr{lr:g}_{runname}"
 wandb.init(project="opus-rein", name=run_name, config={
   "Ngen": Ngen, "alpha": alpha,
   "ent_beta": ent_beta, "kl_beta_final": kl_beta_final, "max_score": max_score,
   "min_eps": min_eps, "max_eps": max_eps,
-  "ripo": ripo, "ripo_delta": ripo_delta, "ripo_r_min": ripo_r_min, "ripo_r_max": ripo_r_max,
   "nmini": nmini, "reward_fn": reward_fn.__name__,
 })
 
 m_ref = deepcopy(m)
 opt = m.init_opt(muon_lr=lr, embd_lr=2e-3, head_lr=3e-4)
 
-# reviewed_puzzles = load_dataset("reciprocate/counterint-4MN-500000", split="train")
-reviewed_puzzles = load_dataset("reciprocate/counterint-1MN-maia-100K-jul26", split="train")
-good_puzzles = reviewed_puzzles.filter(lambda x: x['is_puzzle_three'])
-print(f'{good_puzzles=}')
-print(f'{np.mean(good_puzzles['n_pieces'])=}')
-# good_puzzles = Dataset.from_json("good_puzzles/counterint-1MN-500.json")
-# good_puzzles = good_puzzles.map(lambda x: {"fen": getboard(x).fen()})
+counterint_puzzles = load_dataset("reciprocate/lichess-puzzles-counterintuitive", split="train")
 
-replay_buffer = [{'ix': ix, 'fen': x['FEN'], 'used': 0, 'source': 'lichess'} for ix, x in enumerate(good_puzzles)]
+print(f'{counterint_puzzles=}')
+print(f'{np.mean(counterint_puzzles['n_pieces'])=}')
+
+replay_buffer = [{'ix': ix, 'fen': x['FEN'], 'used': 0, 'source': 'lichess'} for ix, x in enumerate(counterint_puzzles)]
 rng = np.random.RandomState(0)
 
 def save_debug(stepix, fens, sources, measures, rewards, advantages, states, logprobs, logprobs_taken, logprobs_taken_ref, logratio, ratio):
@@ -257,15 +248,7 @@ for stepix in trange(max_steps):
     logratio = logprobs_taken - logprobs_taken_old
     ratio = torch.exp(logratio)
     ratio_mask = ((ratio >= 1-min_eps) | (ratio <= 1+max_eps))
-
-    if ripo:
-      pi_old = torch.exp(logprobs_taken_old).clamp_min(1e-8)
-      ripo_eps = torch.sqrt(ripo_delta / pi_old)
-      lo = (1.0 - ripo_eps).clamp(min=ripo_r_min)
-      hi = (1.0 + ripo_eps).clamp(max=ripo_r_max)
-      ratio_clip = torch.clamp(ratio, lo, hi)
-    else:
-      ratio_clip = torch.clip(ratio, min=1-min_eps, max=1+max_eps)
+    ratio_clip = torch.clip(ratio, min=1-min_eps, max=1+max_eps)
 
     policy_loss = -torch.min(ratio * advantages, ratio_clip * advantages) * ratio_mask
     policy_loss = policy_loss.sum() / ratio_mask.sum()
