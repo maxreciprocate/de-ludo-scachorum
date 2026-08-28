@@ -174,6 +174,7 @@ def load_ref_fens():
 load_ref_fens()
 
 QUALIFIED_SAMPLES_PATH = "qualified_puzzles.jsonl"
+PV_COMPARE_PLIES = 6
 
 if os.path.exists(QUALIFIED_SAMPLES_PATH):
   try:
@@ -202,6 +203,13 @@ def min_pv_distance(pv, ref_pvs):
     return None
   return min(Levenshtein.distance(pv, r) / max(len(pv), len(r)) for r in ref_pvs)
 
+def with_full_pv(evaluation, entry):
+  if entry is None or len(entry['pv']) > 1:
+    return entry
+  cands = [xx for xx in evaluation if xx['multipv'] == entry['multipv'] and xx['move'] == entry['move']
+           and xx['score']['moves'] == entry['score']['moves'] and len(xx['pv']) > 1]
+  return {**entry, "pv": max(cands, key=lambda xx: xx['depth'])['pv']} if cands else entry
+
 def min_fen_distance(expanded_fen, ref_fens=None):
   if ref_fens is None:
     ref_fens = load_ref_fens()
@@ -226,7 +234,7 @@ def evaluate(x, limit):
   b = x if isinstance(x, chess.Board) else getboard(x)
 
   evaluation = []
-  with engine.analysis(b, info=chess.engine.INFO_ALL, limit=limit, multipv=2) as analysis:
+  with engine.analysis(b, info=chess.engine.INFO_ALL, limit=limit, multipv=2, game=object()) as analysis:
     for info in analysis:
       if 'score' in info and 'pv' in info and len(info['pv']) > 0:
         score = info['score'].pov(b.turn)
@@ -239,23 +247,25 @@ def evaluate(x, limit):
           "winprob": win_chances(score),
           "move": info['pv'][0].uci(),
           "pv": [m.uci() for m in info['pv']],
+          "bound": bool(info.get('lowerbound') or info.get('upperbound')),
           "mnps": info['nps'] / 1e6
         })
 
     if not evaluation:
       return {"legal": False, "evaluation": [], "top": None, "second": None, "max_depth": 0}
     max_depth = max(xx['depth'] for xx in evaluation)
-    top = next(xx for xx in evaluation if xx['depth'] == max_depth and xx['multipv'] == 1)
-    try:
-      second = next(xx for xx in evaluation if xx['depth'] == max_depth and xx['multipv'] == 2)
-    except StopIteration:
-      top = next(xx for xx in evaluation if xx['depth'] == max_depth-1 and xx['multipv'] == 1)
-      try:
-        second = next(xx for xx in evaluation if xx['depth'] == max_depth-1 and xx['multipv'] == 2)
-      except StopIteration:
-        second = None
+    top, second = None, None
+    for d in sorted({xx['depth'] for xx in evaluation}, reverse=True):
+      at_depth = [xx for xx in evaluation if xx['depth'] == d and not xx.get('bound')]
+      t = next((xx for xx in at_depth if xx['multipv'] == 1), None)
+      s = next((xx for xx in at_depth if xx['multipv'] == 2), None)
+      if t and s:
+        top, second = t, s
+        break
+    if top is None:
+      top = max((xx for xx in evaluation if xx['multipv'] == 1 and not xx.get('bound')), key=lambda xx: xx['depth'], default=None)
 
-  return {"evaluation": evaluation, "top": top, "second": second, "max_depth": max_depth}
+  return {"evaluation": evaluation, "top": with_full_pv(evaluation, top), "second": with_full_pv(evaluation, second), "max_depth": max_depth}
 
 def is_realistic(board: chess.Board) -> bool:
   for color in [chess.WHITE, chess.BLACK]:
@@ -267,7 +277,7 @@ def is_realistic(board: chess.Board) -> bool:
   return True
 
 def reward(fen, **kwargs):
-  tau_unq, tau_cnt, tau_three = 0.5, 0.1, 0.2
+  tau_unq, tau_cnt, tau_three = 0.5, 0.1, 0.15
   fen_distance_threshold = 6
   pv_distance_threshold = 0.3
 
@@ -348,7 +358,7 @@ def reward(fen, **kwargs):
   prior_pvs = [s['pv'] for s in prior_samples]
   batch_fen_distance = min_fen_distance(expanded_fen, prior_fens)
   first_top = puzzle.positions[0].evaluation['top']
-  pv_str = " ".join(first_top['pv']) if first_top else ""
+  pv_str = " ".join(first_top['pv'][:PV_COMPARE_PLIES]) if first_top else ""
   batch_pv_distance = min_pv_distance(pv_str, prior_pvs)
 
   if score == 1:
@@ -468,9 +478,14 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5, limit=None) -> Puzzle:
       print(f"eval.top == None -> {b.fen()}")
       break
 
+    m_top = eval['top']['score'].get('moves', 1000)
+    m_second = eval['second']['score'].get('moves', 1000) if eval['second'] else 1000
+    top_mates = 0 < m_top < 1000
+    second_mates = 0 < m_second < 1000
+
     # this is very bad, yet inverse is much worse
-    if eval['second'] and 0 < eval['top']['score'].get('moves', np.inf) <= 5 and 0 < eval['second']['score'].get('moves', np.inf) <= 5:
-      info = get_engine().analyse(b, limit=limit, multipv=8)
+    if eval['second'] and 0 < m_top <= 5 and 0 < m_second <= 5:
+      info = get_engine().analyse(b, limit=limit, multipv=8, game=object())
       scores = [pv["score"].pov(b.turn) for pv in info]
       nmates = sum([s >= Mate(5) for s in scores])
       if nmates >= len(scores):
@@ -485,6 +500,8 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5, limit=None) -> Puzzle:
     # if both_mate:
     #   unq = 2.0
 
+    elif eval['second'] and top_mates and not second_mates:
+      unq = 2.0
     elif eval['second']:
       unq = eval['top']['winprob'] - eval['second']['winprob']
     else:
@@ -540,7 +557,7 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5, limit=None) -> Puzzle:
     if len(eval['top']['pv']) > 1:
       b.push_uci(eval['top']['pv'][1])
     else:
-      opmove = get_engine().play(b, limit=limit).move.uci()
+      opmove = get_engine().play(b, limit=limit, game=object()).move.uci()
       b.push_uci(opmove)
 
     if b.is_game_over():
@@ -594,6 +611,23 @@ def test_distance():
   assert d3 == min_pv_distance("a1a2", ["a1a2 b1b2"])
   print(f"pv_distance: {d:.3f} {d2:.3f} {d3:.3f}")
   print("min_pv_distance ~ all good")
+
+  def entry(depth, move, pv, moves=1000):
+    return {"depth": depth, "multipv": 1, "move": move, "score": {"moves": moves, "cp": 0}, "pv": pv}
+
+  truncated = [entry(20, "d3d2", ["d3d2", "g3g4", "d2f2"]), entry(21, "d3d2", ["d3d2", "g3g4", "d2f2", "f1f2"]), entry(22, "d3d2", ["d3d2"])]
+  assert with_full_pv(truncated, truncated[-1])['pv'] == ["d3d2", "g3g4", "d2f2", "f1f2"]
+  assert with_full_pv(truncated, truncated[-1])['depth'] == 22
+  assert with_full_pv(truncated, truncated[-1])['score'] == truncated[-1]['score']
+
+  mate = [entry(5, "h3g4", ["h3g4", "h5g4", "f5e6"]), entry(22, "h3g4", ["h3g4"], moves=1)]
+  assert with_full_pv(mate, mate[-1])['pv'] == ["h3g4"]
+
+  other = [entry(20, "a1a2", ["a1a2", "b1b2"]), entry(21, "c1c2", ["c1c2"])]
+  assert with_full_pv(other, other[-1])['pv'] == ["c1c2"]
+  assert with_full_pv([], None) is None
+  assert with_full_pv(truncated, truncated[0])['pv'] == truncated[0]['pv']
+  print("with_full_pv ~ all good")
 
 def test_goldenset():
   valid = Dataset.from_json(os.path.expanduser("~/data/opus/goldenset-valid.jsonl")).shuffle(0)
