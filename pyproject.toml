@@ -3,7 +3,6 @@ name = "de-ludo-scachorum"
 version = "0.1.0"
 requires-python = "==3.13.*"
 dependencies = [
-    "vllm",
     "RapidFuzz",
     "chess",
     "CairoSVG",
