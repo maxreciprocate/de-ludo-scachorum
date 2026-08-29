@@ -277,7 +277,7 @@ def is_realistic(board: chess.Board) -> bool:
   return True
 
 def reward(fen, **kwargs):
-  tau_unq, tau_cnt, tau_three = 0.5, 0.1, 0.15
+  tau_unq, tau_cnt, tau_three = 0.5, 0.1, 0.17
   fen_distance_threshold = 6
   pv_distance_threshold = 0.3
 
@@ -466,6 +466,15 @@ class Puzzle:
   positions: list[Position]
   measures: dict
 
+def count_mates(board):
+  mates = 0
+  for move in board.legal_moves:
+    board.push(move)
+    if board.is_checkmate():
+      mates += 1
+    board.pop()
+  return mates
+
 def fen_to_puzzle(fen: str, uniqueness_threshold=0.5, limit=None) -> Puzzle:
   if limit is None:
     limit = stockfish_limit
@@ -480,19 +489,15 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5, limit=None) -> Puzzle:
 
     m_top = eval['top']['score'].get('moves', 1000)
     m_second = eval['second']['score'].get('moves', 1000) if eval['second'] else 1000
-    top_mates = 0 < m_top < 1000
-    second_mates = 0 < m_second < 1000
 
-    # this is very bad, yet inverse is much worse
-    if eval['second'] and 0 < m_top <= 5 and 0 < m_second <= 5:
-      info = get_engine().analyse(b, limit=limit, multipv=8, game=object())
+    if eval['second'] and m_top == 1 and m_second == 1:
+      mates = count_mates(b)
+      info = get_engine().analyse(b, limit=limit, multipv=mates + 1, game=object())
       scores = [pv["score"].pov(b.turn) for pv in info]
-      nmates = sum([s >= Mate(5) for s in scores])
-      if nmates >= len(scores):
-        # this used to be 2.0 which is maybe more correct, but on some positions it's terrible
-        unq = 0.0
+      if scores[-1] == Mate(1):
+        unq = 2.0
       else:
-        unq = 1.0 - win_chances(scores[nmates])
+        unq = 1.0 - win_chances(scores[-1])
 
     # m_top = eval['top']['score'].get('moves', 1000)
     # m_second = eval['second']['score'].get('moves', 1000) if eval['second'] else 1000
@@ -500,8 +505,6 @@ def fen_to_puzzle(fen: str, uniqueness_threshold=0.5, limit=None) -> Puzzle:
     # if both_mate:
     #   unq = 2.0
 
-    elif eval['second'] and top_mates and not second_mates:
-      unq = 2.0
     elif eval['second']:
       unq = eval['top']['winprob'] - eval['second']['winprob']
     else:
